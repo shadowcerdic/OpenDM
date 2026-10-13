@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "OpenDM Integration",
-  "version": "1.2.0",
-  "description": "Send downloads to local OpenDM app: multi-connection acceleration, token auth, optional auto-catch.",
+  "version": "2.0.0",
+  "description": "Send downloads to local OpenDM accelerator: multi-connection acceleration, secure Native Messaging auth, and auto-catch.",
   "permissions": [
     "contextMenus",
     "storage",
     "cookies",
-    "downloads"
+    "downloads",
+    "nativeMessaging"
   ],
   "host_permissions": [
     "http://127.0.0.1/*",

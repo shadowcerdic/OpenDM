@@ -1,5 +1,5 @@
 # Register OpenDM extension via standard Windows registry external extension install
-# (the exact same mechanism IDM uses, as verified from HKCU\Software\Google\Chrome\Extensions)
+# Install extension via Chrome registry policy
 
 $root = 'C:\OpenDM'
 $crxPath = "$env:USERPROFILE\.config\opendm\www\manifest.crx"

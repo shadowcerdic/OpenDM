@@ -155,7 +155,12 @@ class HardenedApiHandler(BaseHTTPRequestHandler):
         if not pairing_active():
             self._send_error(403, "Pairing window closed")
             return
-        log_event(f"PAIR granted from Origin={self.headers.get('Origin')}")
+        # Reject non-extension origin
+        origin = self.headers.get("Origin") or ""
+        if not origin.startswith(("chrome-extension://", "moz-extension://")):
+            self._send_error(403, "Pairing allowed only from browser extension origin")
+            return
+        log_event(f"PAIR granted from Origin={origin}")
         self._send_json({"ok": True, "token": TOKEN})
 
     def do_POST(self):

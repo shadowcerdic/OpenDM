@@ -7,7 +7,7 @@ Features:
 - Interactive context menus (right-click on rows)
 - Custom smooth progress bar delegate with connection slice visualization
 - Details modal with real-time per-connection visual segment map
-- Download Confirmation Prompt (Popup like IDM on new download)
+- Download Confirmation Prompt (Interactive popup on intercepted download)
 - Minimize to System Tray support with tray menu & background execution
 - Auto-retry network resiliency in engine
 - Embedded secure daemon
@@ -171,7 +171,7 @@ class ModernProgressDelegate(QStyledItemDelegate):
 
 
 # -----------------------------------------------------------------------------
-# Dialogs: Add URL, Details, Download Prompt (Like IDM)
+# Dialogs: Add URL, Details, Download Prompt
 # -----------------------------------------------------------------------------
 class AddUrlDialog(QDialog):
     def __init__(self, default_dir: str, parent=None, default_url="", suggested_name=""):
@@ -223,6 +223,12 @@ class AddUrlDialog(QDialog):
         row.addWidget(browse_btn)
 
         layout.addLayout(row)
+
+        # Pre-flight metadata label (Size & Range support)
+        self.meta_lbl = QLabel("")
+        self.meta_lbl.setStyleSheet("color: #38bdf8; font-size: 12px; font-weight: 500;")
+        layout.addWidget(self.meta_lbl)
+
         layout.addSpacing(8)
 
         # Action Buttons
@@ -247,9 +253,43 @@ class AddUrlDialog(QDialog):
 
         layout.addLayout(btn_box)
 
+        # Auto-paste from clipboard if URL
         cb = QApplication.clipboard().text().strip()
         if cb.startswith(("http://", "https://")) and not default_url:
             self.url.setText(cb)
+
+        # Trigger async pre-flight metadata resolution
+        self.url.textChanged.connect(self._trigger_preflight)
+        if self.url.text().strip():
+            self._trigger_preflight()
+
+    def _trigger_preflight(self):
+        u = self.url.text().strip()
+        if not u.startswith(("http://", "https://")):
+            return
+        self.meta_lbl.setText("Resolving file metadata…")
+        threading.Thread(target=self._run_preflight, args=(u,), daemon=True).start()
+
+    def _run_preflight(self, u: str):
+        try:
+            from . import engine
+            meta = engine.probe(u)
+            size = meta.get("size", 0)
+            ranges = meta.get("ranges", False)
+            cd_name = meta.get("content_disposition_filename")
+
+            mb = size / (1024 * 1024) if size else 0
+            size_str = f"{mb:.2f} MB ({size:,} bytes)" if size else "Unknown size"
+            range_str = "Accelerated (Range supported)" if ranges else "Single-stream (No Range)"
+
+            def update_ui():
+                self.meta_lbl.setText(f"Size: {size_str}  •  Protocol: {range_str}")
+                if cd_name and not self.fn_input.text().strip():
+                    self.fn_input.setText(cd_name)
+
+            QTimer.singleShot(0, update_ui)
+        except Exception:
+            pass
 
     def _browse(self):
         d = QFileDialog.getExistingDirectory(self, "Select Download Folder", self.dest_dir)
@@ -334,12 +374,13 @@ class DetailsDialog(QDialog):
         for i, p in enumerate(j.parts):
             got = p.get("have", 0)
             span = p.get("end", 0) - p.get("start", 0) + 1
-            ratio = got / max(span, 1)
+            ratio = min(max(got / max(span, 1), 0.0), 1.0)
             bar_len = 28
             filled = int(ratio * bar_len)
             bar = "█" * filled + "░" * (bar_len - filled)
             pct_val = int(ratio * 100)
-            lines.append(f"Connection #{i+1:02d} [{p.get('start',0):>10,} .. {p.get('end',0):>10,}] : {bar} {pct_val:>3}% ({got/mb:.2f} MB)")
+            is_stolen = " [Work-Stolen]" if i >= j.conns else ""
+            lines.append(f"Segment #{i+1:02d}{is_stolen} [{p.get('start',0):>10,} .. {p.get('end',0):>10,}] : {bar} {pct_val:>3}% ({got/mb:.2f} MB)")
 
         if j.sha256:
             lines.append("")
@@ -447,7 +488,7 @@ class MainWindow(QMainWindow):
         QApplication.quit()
 
     def _handle_prompt_in_main_thread(self, url, conns, headers, suggested):
-        """Opens a confirmation dialog on screen just like IDM does."""
+        """Opens a confirmation dialog on screen upon interception."""
         self.showNormal()
         self.activateWindow()
         dlg = AddUrlDialog(self.qm.dest_dir, self, default_url=url, suggested_name=suggested or "")
@@ -520,6 +561,23 @@ class MainWindow(QMainWindow):
         self.btn_open_folder.setIcon(make_icon("folder", "#94a3b8"))
         self.btn_open_folder.clicked.connect(self.open_downloads_folder)
         t_lay.addWidget(self.btn_open_folder)
+
+        self.btn_settings = QPushButton(" Settings")
+        self.btn_settings.setIcon(make_icon("settings", "#94a3b8"))
+        self.btn_settings.clicked.connect(self.open_settings)
+        t_lay.addWidget(self.btn_settings)
+
+        t_lay.addSpacing(16)
+        t_lay.addWidget(QLabel("Speed Limit:"))
+        self.speed_slider = QSlider(Qt.Horizontal)
+        self.speed_slider.setRange(0, 100)  # 0 = Unlimited, 100 = 100 MB/s
+        self.speed_slider.setValue(0)
+        self.speed_slider.setFixedWidth(120)
+        self.speed_slider_lbl = QLabel("Unlimited")
+        self.speed_slider_lbl.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: bold; min-width: 65px;")
+        self.speed_slider.valueChanged.connect(self._on_speed_slider_changed)
+        t_lay.addWidget(self.speed_slider)
+        t_lay.addWidget(self.speed_slider_lbl)
 
         t_lay.addStretch()
         root_lay.addWidget(toolbar)
@@ -632,6 +690,10 @@ class MainWindow(QMainWindow):
         act_cancel = menu.addAction("Cancel / Remove")
         act_cancel.triggered.connect(job.cancel)
 
+        if job.state in ("paused", "error"):
+            act_refresh = menu.addAction("Refresh Download Address…")
+            act_refresh.triggered.connect(lambda: self._refresh_job_address(job))
+
         if job.state == "completed" and os.path.exists(job.dest):
             menu.addSeparator()
             act_open = menu.addAction("Open Downloaded File")
@@ -651,6 +713,82 @@ class MainWindow(QMainWindow):
                 subprocess.Popen(["xdg-open", path])
         except Exception:
             pass
+
+    def _refresh_job_address(self, job):
+        """Allows updating URL, Cookies, and Referer for an existing partially downloaded job."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Refresh Address — {job.filename}")
+        dlg.setMinimumWidth(560)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel(f"Update expired/invalid download address for <b>{job.filename}</b>:"))
+
+        url_in = QLineEdit(job.url)
+        url_in.setClearButtonEnabled(True)
+        lay.addWidget(url_in)
+
+        # Pre-fill clipboard if URL
+        cb = QApplication.clipboard().text().strip()
+        if cb.startswith(("http://", "https://")) and cb != job.url:
+            url_in.setText(cb)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+
+        if dlg.exec():
+            new_u = url_in.text().strip()
+            if new_u.startswith(("http://", "https://")):
+                job.url = new_u
+                if job.state == "error":
+                    job.state = "paused"
+                self.qm._save()
+                self.refresh_rows()
+                self._update_actions_state()
+                QMessageBox.information(
+                    self, "Address Updated",
+                    "Download URL has been refreshed successfully.\nYou can now Resume the download."
+                )
+
+    def _on_speed_slider_changed(self, val: int):
+        if val == 0:
+            self.speed_slider_lbl.setText("Unlimited")
+            limit_bytes = 0
+        else:
+            self.speed_slider_lbl.setText(f"{val} MB/s")
+            limit_bytes = val * 1024 * 1024
+        for job in self.qm.jobs:
+            if hasattr(job, "speed_limit"):
+                job.speed_limit = limit_bytes
+
+    def open_settings(self):
+        """Proxy configuration dialog (HTTP / SOCKS5)."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Network & Proxy Settings")
+        dlg.setMinimumWidth(480)
+        lay = QVBoxLayout(dlg)
+
+        info = QLabel("Configure network proxy for all download requests (e.g., SOCKS5 or HTTP):")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+
+        form = QFormLayout()
+        proxy_in = QLineEdit()
+        proxy_in.setPlaceholderText("socks5://127.0.0.1:10808 or http://127.0.0.1:8080")
+        current_proxy = getattr(self.qm, "proxy", "") or ""
+        proxy_in.setText(current_proxy)
+        form.addRow("Proxy URL:", proxy_in)
+        lay.addLayout(form)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+
+        if dlg.exec():
+            p_val = proxy_in.text().strip()
+            self.qm.proxy = p_val if p_val else None
+            QMessageBox.information(self, "Settings Saved", f"Proxy set to: {p_val or 'None (Direct connection)'}")
 
     def open_downloads_folder(self):
         d = self.qm.dest_dir
