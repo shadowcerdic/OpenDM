@@ -19,6 +19,12 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from opendm.security import load_or_create_config, config_dir
 
+# On Windows, stdin and stdout default to text mode (\r\n translation will corrupt 32-bit length headers)
+if sys.platform == "win32":
+    import msvcrt
+    msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+    msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+
 
 def read_message() -> dict | None:
     raw_length = sys.stdin.buffer.read(4)

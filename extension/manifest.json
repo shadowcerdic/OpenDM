@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "OpenDM Integration",
   "version": "2.0.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmsa/Uz1aUBf6xJrJhbNZYEikjteu9F6b3VPOKw+7iRjPP+IqYX0/KgluZv2HMajMDby3Eso3qm3sN9gCC0dVY2KipBZMDZ4kZuawSrKSUk/TLlsu/s1S/3sH2bOktd+rtjJFT4GwhGzV3LwNHbfa6vOQXCGeu34B0MGNFeIY0lM0EB/1wFidodRSsGrEHLKKE9wa+2voTTyWrA22ZWArtmyt187s2MPOY0v4bOwC/3H3/2WFOPDKagNwYdFIRgYxIEH3ScAWFK7NaG/fsWhFsYvBCpSZTIQLrCELIS6TqRsaOWOP4LWibOa95KoCADs1T+ZpfcKWNhSce8gAq1r40wIDAQAB",
   "description": "Send downloads to local OpenDM accelerator: multi-connection acceleration, secure Native Messaging auth, and auto-catch.",
   "permissions": [
     "contextMenus",

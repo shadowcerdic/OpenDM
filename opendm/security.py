@@ -46,6 +46,7 @@ def load_or_create_config() -> dict:
         "ws_port": DEFAULT_WS_PORT,
         "download_dir": str(Path.home() / "Downloads"),
         "allowed_origins": [
+            "chrome-extension://hnhmponoadleelhnecpijhnlpefkjflc",
             "chrome-extension://*",
             "moz-extension://*",
         ],

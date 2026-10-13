@@ -4,6 +4,6 @@
   "path": "C:\\OpenDM\\app\\opendm\\native_host.bat",
   "type": "stdio",
   "allowed_origins": [
-    "chrome-extension://*/*"
+    "chrome-extension://hnhmponoadleelhnecpijhnlpefkjflc/"
   ]
 }
