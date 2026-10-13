@@ -507,10 +507,13 @@ class MainWindow(QMainWindow):
         self.tree.setColumnWidth(4, 105)
         self.tree.setColumnWidth(5, 95)
         self.tree.setColumnWidth(6, 140)
+        self.tree.setSelectionMode(QTreeWidget.SingleSelection)
+        self.tree.setSelectionBehavior(QTreeWidget.SelectRows)
         self.tree.setRootIsDecorated(False)
         self.tree.setAlternatingRowColors(True)
         self.tree.setItemDelegateForColumn(2, ModernProgressDelegate(self.tree))
         self.tree.itemDoubleClicked.connect(self.details_item)
+        self.tree.itemSelectionChanged.connect(self._update_actions_state)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._show_context_menu)
 
@@ -589,25 +592,44 @@ class MainWindow(QMainWindow):
             self.refresh_rows()
 
     def _selected_job(self):
-        it = self.tree.currentItem()
+        items = self.tree.selectedItems()
+        it = items[0] if items else self.tree.currentItem()
         if not it:
             return None
         return it.data(0, Qt.UserRole) or it.data(2, Qt.UserRole)
+
+    def _update_actions_state(self):
+        j = self._selected_job()
+        has_sel = j is not None
+        self.btn_details.setEnabled(has_sel)
+        self.btn_cancel.setEnabled(has_sel)
+        if has_sel:
+            self.btn_pause.setEnabled(j.state == "downloading")
+            self.btn_start.setEnabled(j.state in ("paused", "error", "queued"))
+        else:
+            self.btn_pause.setEnabled(True)
+            self.btn_start.setEnabled(True)
 
     def pause_selected(self):
         j = self._selected_job()
         if j:
             j.pause()
+            self.refresh_rows()
+            self._update_actions_state()
 
     def resume_selected(self):
         j = self._selected_job()
-        if j and j.state in ("paused", "error"):
+        if j and j.state in ("paused", "error", "queued"):
             j.resume()
+            self.refresh_rows()
+            self._update_actions_state()
 
     def cancel_selected(self):
         j = self._selected_job()
         if j:
             j.cancel()
+            self.refresh_rows()
+            self._update_actions_state()
 
     def details_selected(self):
         j = self._selected_job()

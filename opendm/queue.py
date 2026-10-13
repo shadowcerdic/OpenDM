@@ -102,6 +102,9 @@ class Job:
 
     def pause(self):
         self._stop.set()
+        if self.state == "downloading":
+            self.state = "paused"
+            self._notify()
 
     def cancel(self):
         self._stop.set()
