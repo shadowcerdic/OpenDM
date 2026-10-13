@@ -432,6 +432,9 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.refresh_rows)
         self.timer.start(350)
 
+        # Background update check (5 seconds after startup)
+        QTimer.singleShot(5000, lambda: self.check_updates_gui(manual=False))
+
     def _start_embedded_daemon(self):
         try:
             from . import daemon as daemon_mod
@@ -566,6 +569,11 @@ class MainWindow(QMainWindow):
         self.btn_settings.setIcon(make_icon("settings", "#94a3b8"))
         self.btn_settings.clicked.connect(self.open_settings)
         t_lay.addWidget(self.btn_settings)
+
+        self.btn_update = QPushButton(" Updates")
+        self.btn_update.setIcon(make_icon("app", "#38bdf8"))
+        self.btn_update.clicked.connect(lambda: self.check_updates_gui(manual=True))
+        t_lay.addWidget(self.btn_update)
 
         t_lay.addSpacing(16)
         t_lay.addWidget(QLabel("Speed Limit:"))
@@ -778,6 +786,11 @@ class MainWindow(QMainWindow):
         current_proxy = getattr(self.qm, "proxy", "") or ""
         proxy_in.setText(current_proxy)
         form.addRow("Proxy URL:", proxy_in)
+
+        auto_update_cb = QCheckBox("Automatically check for updates on startup")
+        auto_update_cb.setChecked(getattr(self, "auto_check_updates", True))
+        form.addRow("", auto_update_cb)
+
         lay.addLayout(form)
 
         bb = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
@@ -788,7 +801,141 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             p_val = proxy_in.text().strip()
             self.qm.proxy = p_val if p_val else None
+            self.auto_check_updates = auto_update_cb.isChecked()
             QMessageBox.information(self, "Settings Saved", f"Proxy set to: {p_val or 'None (Direct connection)'}")
+
+    def check_updates_gui(self, manual: bool = True):
+        """Asynchronously query GitHub Releases API and display update dialog."""
+        if not manual and not getattr(self, "auto_check_updates", True):
+            return
+
+        def _worker():
+            try:
+                from . import updater
+                proxy = getattr(self.qm, "proxy", None)
+                info = updater.check_for_updates(proxy=proxy)
+                QTimer.singleShot(0, lambda: self._handle_update_result(info, manual))
+            except Exception as ex:
+                if manual:
+                    QTimer.singleShot(0, lambda: QMessageBox.warning(self, "Update Error", f"Failed to check updates:\n{ex}"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _handle_update_result(self, info: dict | None, manual: bool):
+        if not info or info.get("error"):
+            if manual:
+                err = info.get("error") if info else "Unknown error"
+                QMessageBox.warning(self, "Update Check Failed", f"Could not check for updates:\n{err}")
+            return
+
+        from . import __version__
+        tag = info.get("tag_name", "")
+        if not info.get("is_newer"):
+            if manual:
+                QMessageBox.information(self, "Latest Version", f"You are running the latest version (v{__version__}).")
+            return
+
+        # Display Update Dialog
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Software Update Available — OpenDM")
+        dlg.setMinimumWidth(560)
+        lay = QVBoxLayout(dlg)
+
+        badge_box = QFrame()
+        badge_box.setStyleSheet("background: #0f172a; border-radius: 8px; padding: 12px;")
+        b_lay = QVBoxLayout(badge_box)
+        v_lbl = QLabel(f"<b>A new version is available!</b> &nbsp; Current: <code>v{__version__}</code> &nbsp;➔&nbsp; <span style='color:#38bdf8; font-weight:bold;'>{tag}</span>")
+        v_lbl.setStyleSheet("font-size: 13px; color: #f8fafc;")
+        b_lay.addWidget(v_lbl)
+        if info.get("expected_sha256"):
+            sha_lbl = QLabel(f"<span style='color: #22c55e;'>✓ Verified SHA-256 Digest:</span> <code>{info['expected_sha256'][:16]}…</code>")
+            sha_lbl.setStyleSheet("font-size: 11px; color: #94a3b8;")
+            b_lay.addWidget(sha_lbl)
+        lay.addWidget(badge_box)
+
+        lay.addWidget(QLabel("Release Notes:"))
+        notes_box = QPlainTextEdit()
+        notes_box.setReadOnly(True)
+        notes_box.setPlainText(info.get("body", "No release notes provided."))
+        notes_box.setStyleSheet("background: #0f172a; color: #cbd5e1; font-family: sans-serif; font-size: 12px; border: 1px solid #1e293b; border-radius: 6px;")
+        notes_box.setFixedHeight(180)
+        lay.addWidget(notes_box)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        later_btn = QPushButton("Later")
+        later_btn.clicked.connect(dlg.reject)
+        btn_row.addWidget(later_btn)
+
+        install_btn = QPushButton("Download & Update Now")
+        install_btn.setStyleSheet("background: #2563eb; color: white; font-weight: bold; padding: 8px 18px; border-radius: 6px;")
+        btn_row.addWidget(install_btn)
+        lay.addLayout(btn_row)
+
+        installer_url = info.get("installer_url")
+
+        def _do_update():
+            dlg.accept()
+            if not installer_url:
+                QMessageBox.warning(self, "No Installer Asset", "OpenDM-Setup.exe asset was not found in release.")
+                return
+            self._start_update_download(installer_url, tag, info.get("expected_sha256"))
+
+        install_btn.clicked.connect(_do_update)
+        dlg.exec()
+
+    def _start_update_download(self, url: str, tag: str, expected_sha: str | None):
+        from . import updater
+        target_path = updater.get_update_target_path(tag)
+        dest_dir = os.path.dirname(target_path)
+        filename = os.path.basename(target_path)
+
+        # Enqueue update download directly into OpenDM engine
+        job = self.qm.add(
+            url=url,
+            conns=4,
+            dest_dir=dest_dir,
+            suggested_filename=filename,
+        )
+        if expected_sha:
+            job.expected_sha256 = expected_sha
+
+        # Completion handler: trigger detached installer and clean app exit
+        def on_update_complete():
+            def _ask_install():
+                ret = QMessageBox.question(
+                    self, "Update Downloaded",
+                    f"OpenDM {tag} has been downloaded and verified successfully.\n\nInstall update now?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if ret == QMessageBox.Yes:
+                    self._launch_installer_and_quit(target_path)
+
+            QTimer.singleShot(0, _ask_install)
+
+        # Monitor job completion
+        orig_post_finish = getattr(job, "post_finish", None)
+        def hooked_finish():
+            if orig_post_finish:
+                orig_post_finish()
+            if job.state == "completed":
+                on_update_complete()
+        job.post_finish = hooked_finish
+
+        job.start()
+        self.refresh_rows()
+        QMessageBox.information(
+            self, "Update Started",
+            f"Downloading {filename} via OpenDM accelerated engine.\nYou will be prompted to install once verified."
+        )
+
+    def _launch_installer_and_quit(self, installer_path: str):
+        from . import updater
+        def _clean_exit():
+            self.qm._save()
+            QApplication.quit()
+
+        updater.execute_installer_and_exit(installer_path, on_before_exit=_clean_exit)
 
     def open_downloads_folder(self):
         d = self.qm.dest_dir
