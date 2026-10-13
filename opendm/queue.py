@@ -11,6 +11,8 @@ from pathlib import Path
 from . import engine
 from .sanitize import sanitize_filename, unique_destination
 
+STATES = ("queued", "downloading", "paused", "completed", "error", "assembling")
+
 DEFAULT_CATEGORIES = {
     "General": ("*",),
     "Compressed": ("zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso"),
@@ -42,6 +44,7 @@ class Job:
         job_id: int | None = None,
         state: str = "queued",
         filename: str | None = None,
+        suggested_filename: str | None = None,
     ):
         with Job._id_lock:
             if job_id is not None:
@@ -58,6 +61,11 @@ class Job:
         self.headers = {k: v for k, v in (headers or {}).items()
                         if k.lower() in ("cookie", "referer", "user-agent", "authorization")}
 
+        # Filename precedence: sanitized suggested name (bare filename only)
+        # > URL basename > default. Sanitized server-side regardless.
+        if suggested_filename:
+            filename = sanitize_filename(
+                os.path.basename(suggested_filename.replace("\\", "/")) or "download.bin")
         if not filename:
             path_part = urllib.parse.urlparse(url).path
             raw = os.path.basename(path_part) or "download.bin"
@@ -232,8 +240,9 @@ class QueueManager:
                 pass
 
     def add(self, url: str, conns: int = 4, dest_dir: str | None = None,
-            headers: dict | None = None) -> Job:
-        job = Job(url, dest_dir or self.dest_dir, conns=conns, headers=headers)
+            headers: dict | None = None, suggested_filename: str | None = None) -> Job:
+        job = Job(url, dest_dir or self.dest_dir, conns=conns, headers=headers,
+                  suggested_filename=suggested_filename)
         job._on_change = self._save
         with self.lock:
             self.jobs.append(job)

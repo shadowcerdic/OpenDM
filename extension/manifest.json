@@ -1,12 +1,13 @@
 {
   "manifest_version": 3,
   "name": "OpenDM Integration",
-  "version": "1.1.0",
-  "description": "Send download links to local OpenDM daemon with token authentication and cookies/referer support.",
+  "version": "1.2.0",
+  "description": "Send downloads to local OpenDM app: multi-connection acceleration, token auth, optional auto-catch.",
   "permissions": [
     "contextMenus",
     "storage",
-    "cookies"
+    "cookies",
+    "downloads"
   ],
   "host_permissions": [
     "http://127.0.0.1/*",

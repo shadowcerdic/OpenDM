@@ -132,15 +132,18 @@ class HardenedApiHandler(BaseHTTPRequestHandler):
 
         # Security: 'dest', 'dest_dir', 'path' fields are deliberately ignored;
         # destination ALWAYS comes from server config, never from request payload.
+        # 'suggested_filename' is accepted but sanitized to a bare filename.
         conns = int(data.get("connections", 4))
         extra_headers = data.get("headers") or {}
         safe_headers = {k: v for k, v in extra_headers.items()
                         if k.lower() in ("cookie", "referer", "user-agent")}
 
-        job = QM.add(url, conns=conns, headers=safe_headers)
+        suggested = data.get("suggested_filename")
+        job = QM.add(url, conns=conns, headers=safe_headers,
+                     suggested_filename=suggested if isinstance(suggested, str) else None)
         job.start()
         self._send_json({"ok": True, "job_id": job.id, "status": job.state,
-                         "saved_to_dir": DEST_DIR})
+                         "saved_to_dir": DEST_DIR, "filename": job.filename})
 
     def log_message(self, *a):
         pass

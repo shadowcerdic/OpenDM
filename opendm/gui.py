@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 
 from PySide6.QtCore import Qt, QTimer, QUrl
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QFontDialog, QDialogButtonBox, QTabWidget, QPlainTextEdit,
     QGroupBox, QSlider, QCheckBox, QTableWidgetItem, QTableWidget,
 )
+from http.server import HTTPServer
 
 from .queue import QueueManager, STATES
 
@@ -140,6 +142,10 @@ class MainWindow(QMainWindow):
         os.makedirs(dest, exist_ok=True)
         self.qm = QueueManager(dest)
 
+        # Embedded daemon: serve the extension API while the app runs
+        self._daemon_thread = None
+        self._start_embedded_daemon()
+
         self._build_menu()
         self._build_toolbar()
         self._build_tree()
@@ -148,6 +154,21 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_rows)
         self.timer.start(400)
+
+    def _start_embedded_daemon(self):
+        """Run the hardened HTTP API inside the GUI process (port 10010).
+        If the port is already served (standalone daemon), skip silently."""
+        try:
+            from . import daemon as daemon_mod
+            daemon_mod.QM = self.qm  # share the same queue
+            httpd = HTTPServer(("127.0.0.1", daemon_mod.HTTP_PORT),
+                               daemon_mod.HardenedApiHandler)
+            self._daemon_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            self._daemon_thread.start()
+        except OSError:
+            pass  # standalone daemon already listening
+        except Exception:
+            pass
 
     # ---- UI construction ------------------------------------------------
     def _build_menu(self):
