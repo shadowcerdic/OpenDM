@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import threading
+import time
 import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -21,6 +22,7 @@ from opendm.security import (
     load_or_create_config,
     origin_allowed,
     host_allowed,
+    config_path,
 )
 
 CONFIG = load_or_create_config()
@@ -29,8 +31,29 @@ HTTP_PORT = int(CONFIG.get("http_port", 10010))
 WS_PORT = int(CONFIG.get("ws_port", 10011))
 ALLOWED_ORIGINS = list(CONFIG.get("allowed_origins", ["chrome-extension://*"]))
 DEST_DIR = CONFIG.get("download_dir", os.path.join(os.path.expanduser("~"), "Downloads"))
+EXT_WWW_DIR = os.path.join(os.path.dirname(config_path()), "www")  # crx + updates.xml
 
 QM = QueueManager(DEST_DIR)
+
+EVENTS_LOG = os.path.join(os.path.dirname(config_path()), "events.log")
+
+
+def log_event(msg: str):
+    import datetime
+    try:
+        with open(EVENTS_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.datetime.now().isoformat()} {msg}\n")
+    except Exception:
+        pass
+
+
+def pairing_active() -> bool:
+    """True for 120s after an admin creates the 'pairing' flag file."""
+    flag = os.path.join(os.path.dirname(config_path()), "pairing")
+    if not os.path.exists(flag):
+        return False
+    age = time.time() - os.path.getmtime(flag)
+    return age < 120
 
 
 class HardenedApiHandler(BaseHTTPRequestHandler):
@@ -85,20 +108,55 @@ class HardenedApiHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._check_host():
             return
-        # Origin must either be absent (direct tool/curl) or allowed
         origin = self.headers.get("Origin")
         if origin and not origin_allowed(origin, ALLOWED_ORIGINS):
             self._send_error(403, "Origin not allowed")
             return
+
+        path = urllib.parse.urlparse(self.path).path
+
+        # -- public (no token): extension serving + pairing (time-boxed) ----
+        if path in ("/ext/manifest.crx", "/ext/updates.xml"):
+            return self._serve_extension_file(path)
+        if path == "/api/v1/pair":
+            return self._handle_pair()
+
         if not self._check_auth():
             return
-        path = urllib.parse.urlparse(self.path).path
         if path == "/api/v1/status":
             self._send_json({"ok": True, "service": "opendm", "version": "1.0.0"})
         elif path == "/api/v1/jobs":
             self._send_json({"ok": True, "jobs": QM.snapshot()})
         else:
             self._send_error(404, "Unknown endpoint")
+
+    # -- extension install/serve (self-hosted CRX update flow) --------------
+    def _serve_extension_file(self, path):
+        import mimetypes
+        name = os.path.basename(path)
+        fp = os.path.join(EXT_WWW_DIR, name)
+        if not os.path.isfile(fp):
+            self._send_error(404, f"{name} not found (run opendm.packext first)")
+            return
+        ctype = "application/x-chrome-extension" if name.endswith(".crx") else "text/xml"
+        size = os.path.getsize(fp)
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        with open(fp, "rb") as f:
+            while True:
+                b = f.read(65536)
+                if not b:
+                    break
+                self.wfile.write(b)
+
+    def _handle_pair(self):
+        if not pairing_active():
+            self._send_error(403, "Pairing window closed")
+            return
+        log_event(f"PAIR granted from Origin={self.headers.get('Origin')}")
+        self._send_json({"ok": True, "token": TOKEN})
 
     def do_POST(self):
         if not self._check_host():
