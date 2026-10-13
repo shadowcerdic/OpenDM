@@ -34,14 +34,14 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "startupicon"; Description: "Start OpenDM automatically when Windows starts"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
-; Python Embedded runtime and application payload
-Source: "C:\OpenDM\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Staged Python Embedded runtime and application payload
+Source: "build_stage\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\python\pythonw.exe"; Parameters: "-m opendm.gui"; WorkingDir: "{app}\app"; IconFilename: "{app}\app\opendm.ico"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\python\pythonw.exe"; Parameters: "-m opendm.gui"; WorkingDir: "{app}\app"
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\python\pythonw.exe"; Parameters: "-m opendm.gui"; WorkingDir: "{app}\app"; IconFilename: "{app}\app\opendm.ico"; Tasks: desktopicon
-Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\python\pythonw.exe"; Parameters: "-m opendm.gui"; WorkingDir: "{app}\app"; IconFilename: "{app}\app\opendm.ico"; Tasks: startupicon
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\python\pythonw.exe"; Parameters: "-m opendm.gui"; WorkingDir: "{app}\app"; Tasks: desktopicon
+Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\python\pythonw.exe"; Parameters: "-m opendm.gui"; WorkingDir: "{app}\app"; Tasks: startupicon
 
 [Registry]
 ; Register Chrome Native Messaging Host for OpenDM session token bootstrapping

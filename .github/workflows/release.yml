@@ -1,0 +1,120 @@
+name: Release OpenDM Windows Installer
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build & Publish Windows Release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python for Testing & Staging
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Test Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PySide6 websockets pytest cryptography
+
+      - name: Run Test Suite (Build Integrity Check)
+        run: |
+          $env:PYTHONPATH = "."
+          pytest tests/ -v
+
+      - name: Prepare Staged Windows Runtime & Payload
+        shell: pwsh
+        run: |
+          # 1. Create clean build_stage directories
+          New-Item -ItemType Directory -Path "build_stage\python" -Force | Out-Null
+          New-Item -ItemType Directory -Path "build_stage\app" -Force | Out-Null
+          New-Item -ItemType Directory -Path "dist" -Force | Out-Null
+
+          # 2. Download Official Python 3.12 Embedded package
+          $pyUrl = "https://www.python.org/ftp/python/3.12.8/python-3.12.8-embed-amd64.zip"
+          Write-Host "Downloading Python Embeddable package: $pyUrl"
+          Invoke-WebRequest -Uri $pyUrl -OutFile "python-embed.zip"
+          Expand-Archive -Path "python-embed.zip" -DestinationPath "build_stage\python" -Force
+          Remove-Item "python-embed.zip"
+
+          # 3. Configure python312._pth for site-packages and app import
+          $pthFile = "build_stage\python\python312._pth"
+          $pthLines = @("python312.zip", ".", "Lib\site-packages", "..\app", "import site")
+          Set-Content -Path $pthFile -Value $pthLines
+
+          # 4. Bootstrap pip into embedded python
+          Invoke-WebRequest -Uri "https://bootstrap.pypa.io/get-pip.py" -OutFile "get-pip.py"
+          & "build_stage\python\python.exe" get-pip.py --no-warn-script-location
+          Remove-Item "get-pip.py"
+
+          # 5. Install PySide6 and runtime dependencies into embedded environment
+          & "build_stage\python\python.exe" -m pip install --no-warn-script-location PySide6 websockets cryptography
+
+          # 6. Copy OpenDM application files and Chrome extension
+          Copy-Item -Path "opendm" -Destination "build_stage\app\opendm" -Recurse -Force
+          Copy-Item -Path "extension" -Destination "build_stage\app\extension" -Recurse -Force
+          Copy-Item -Path "README.md" -Destination "build_stage\app\" -Force
+          Copy-Item -Path "LICENSE" -Destination "build_stage\app\" -Force
+
+      - name: Compile Inno Setup Standalone Installer
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $iscc = "C:\Program Files\Inno Setup 6\ISCC.exe"
+          }
+          Write-Host "Compiling installer using: $iscc"
+          & $iscc "installer.iss"
+
+      - name: Package Chrome Extension .zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "extension\*" -DestinationPath "dist\OpenDM-Chrome-Extension.zip" -Force
+
+      - name: Generate SHA-256 Checksums
+        shell: pwsh
+        working-directory: dist
+        run: |
+          Get-ChildItem -Filter "*.exe", "*.zip" | ForEach-Object {
+            $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)"
+          } | Set-Content -Path "SHA256SUMS.txt"
+          Get-Content "SHA256SUMS.txt"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/OpenDM-Setup.exe
+            dist/OpenDM-Chrome-Extension.zip
+            dist/SHA256SUMS.txt
+          name: OpenDM Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## OpenDM High-Performance HTTP Download Accelerator
+            
+            ### Quick Download & Install
+            - **Windows Standalone Installer**: [OpenDM-Setup.exe](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/OpenDM-Setup.exe)
+            - **Chrome Extension (Manifest v3)**: [OpenDM-Chrome-Extension.zip](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/OpenDM-Chrome-Extension.zip)
+            
+            ### What's New
+            - **Pre-allocation & Lock-Free I/O**: Target files pre-allocated with direct seek writes (zero `.part` files, zero post-download linear `assemble()` wait).
+            - **Dynamic In-Flight Work Stealing**: Automatically detects slowed sockets and splits remaining segments in-flight aligned to 4KB pages.
+            - **Protocol Safety**: Mid-segment 200 OK corruption guard and ETag / `If-Range` validation on Resume.
+            - **Chrome Native Messaging**: Token bootstrap directly via standard stdin/stdout without exposing credentials over HTTP.
+            - **Modern Fluent UI**: Speed limiter slider, SOCKS5/HTTP proxy support, and live visual connection slice monitor.
+            
+            Verify file integrity with the attached `SHA256SUMS.txt`.

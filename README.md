@@ -1,6 +1,22 @@
 # OpenDM v2.0 — High-Performance HTTP Download Accelerator
 
+[![GitHub release (latest by date)](https://img.shields.io/github/v/release/shadowcerdic/OpenDM?color=38bdf8&style=flat-square)](https://github.com/shadowcerdic/OpenDM/releases)
+[![GitHub all releases download counter](https://img.shields.io/github/downloads/shadowcerdic/OpenDM/total?color=22c55e&style=flat-square)](https://github.com/shadowcerdic/OpenDM/releases)
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg?style=flat-square)](LICENSE)
+
 An open-source, multi-connection HTTP download accelerator featuring dynamic in-flight range partitioning, lock-free pre-allocated disk I/O, and a modern Fluent PySide6 interface.
+
+---
+
+## ⚡ Direct Download (Windows)
+
+No Python installation required. Standalone pre-packaged binaries for Windows (64-bit):
+
+- 📦 **[Download OpenDM Standalone Installer (OpenDM-Setup.exe)](https://github.com/shadowcerdic/OpenDM/releases/latest/download/OpenDM-Setup.exe)**  
+  *(Includes Python Embedded runtime, desktop shortcuts, background system tray support, and Chrome Native Messaging registration)*
+- 🧩 **[Download Chrome Extension (OpenDM-Chrome-Extension.zip)](https://github.com/shadowcerdic/OpenDM/releases/latest/download/OpenDM-Chrome-Extension.zip)**  
+  *(Manifest v3 extension for automatic browser interception and right-click download)*
+- 🔍 **[SHA256 Checksums](https://github.com/shadowcerdic/OpenDM/releases/latest/download/SHA256SUMS.txt)**
 
 ---
 
