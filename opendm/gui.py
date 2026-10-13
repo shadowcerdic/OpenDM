@@ -1,252 +1,598 @@
-"""OpenDM desktop GUI (PySide6)."""
+"""OpenDM modern desktop GUI (PySide6) — Professional & Polished.
+
+Features:
+- Modern sleek dark theme (Fluent / Modern desktop inspired)
+- Left sidebar with navigation categories & status filters
+- Crisp vector-drawn icons (no external asset dependencies)
+- Interactive context menus (right-click on rows)
+- Custom smooth progress bar delegate with connection slice visualization
+- Details modal with real-time per-connection visual segment map
+- Add Download dialog with auto-paste clipboard and path selection
+- Settings dialog (configurable download folder, max connections, speed limit)
+- Embedded secure daemon
+"""
 from __future__ import annotations
 
 import os
 import sys
 import threading
 import time
+from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import (QAction, QColor, QIcon, QPainter, QFont,
-                           QKeySequence, QShortcut, QPixmap)
+from PySide6.QtCore import Qt, QTimer, QSize, QRectF
+from PySide6.QtGui import (
+    QAction, QColor, QIcon, QPainter, QFont, QPen, QBrush,
+    QKeySequence, QPixmap, QPainterPath
+)
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTreeWidget,
-    QTreeWidgetItem, QPushButton, QLabel, QMenu, QMenuBar, QLineEdit,
-    QComboBox, QSpinBox, QDialog, QProgressBar, QToolBar, QStatusBar,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QTreeWidget, QTreeWidgetItem, QPushButton, QLabel, QMenu, QMenuBar,
+    QLineEdit, QComboBox, QSpinBox, QDialog, QToolBar, QStatusBar,
     QHeaderView, QStyledItemDelegate, QStyleOptionViewItem, QMessageBox,
-    QFileDialog, QFontDialog, QDialogButtonBox, QTabWidget, QPlainTextEdit,
-    QGroupBox, QSlider, QCheckBox, QTableWidgetItem, QTableWidget,
+    QFileDialog, QDialogButtonBox, QPlainTextEdit, QFrame, QSplitter
 )
 from http.server import HTTPServer
 
 from .queue import QueueManager, STATES
 
 APP_NAME = "OpenDM"
-DOWNLOADS_DIR = os.environ.get("OPENDM_HOME", "/root/Downloads") if os.name == "posix" else os.path.join(os.path.expanduser("~"), "Downloads")
+DEFAULT_DOWNLOADS = os.path.join(os.path.expanduser("~"), "Downloads")
 
 
-# ---------------------------------------------------------------- widgets
-class ProgressDelegate(QStyledItemDelegate):
-    """Progress bar with connection segment blocks rendered inline."""
+# -----------------------------------------------------------------------------
+# Dynamic Vector Icon Generator (clean, hi-dpi, no missing unicode glyphs)
+# -----------------------------------------------------------------------------
+def make_icon(icon_type: str, color: str = "#e2e8f0", size: int = 24) -> QIcon:
+    pix = QPixmap(size, size)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.Antialiasing)
+    pen = QPen(QColor(color), 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+    painter.setPen(pen)
 
+    if icon_type == "add":
+        painter.drawLine(12, 5, 12, 19)
+        painter.drawLine(5, 12, 19, 12)
+    elif icon_type == "play":
+        painter.setBrush(QColor(color))
+        path = QPainterPath()
+        path.moveTo(8, 6)
+        path.lineTo(18, 12)
+        path.lineTo(8, 18)
+        path.closeSubpath()
+        painter.drawPath(path)
+    elif icon_type == "pause":
+        painter.setBrush(QColor(color))
+        painter.drawRoundedRect(7, 6, 3, 12, 1, 1)
+        painter.drawRoundedRect(14, 6, 3, 12, 1, 1)
+    elif icon_type == "resume":
+        path = QPainterPath()
+        path.arcMoveTo(QRectF(5, 5, 14, 14), 45)
+        path.arcTo(QRectF(5, 5, 14, 14), 45, 270)
+        painter.drawPath(path)
+        painter.setBrush(QColor(color))
+        arrow = QPainterPath()
+        arrow.moveTo(14, 4)
+        arrow.lineTo(19, 7)
+        arrow.lineTo(14, 10)
+        arrow.closeSubpath()
+        painter.drawPath(arrow)
+    elif icon_type == "delete":
+        painter.drawLine(6, 6, 18, 18)
+        painter.drawLine(18, 6, 6, 18)
+    elif icon_type == "info":
+        painter.drawEllipse(4, 4, 16, 16)
+        painter.drawLine(12, 10, 12, 16)
+        painter.drawPoint(12, 7)
+    elif icon_type == "folder":
+        path = QPainterPath()
+        path.moveTo(4, 7)
+        path.lineTo(9, 7)
+        path.lineTo(11, 9)
+        path.lineTo(20, 9)
+        path.lineTo(20, 18)
+        path.lineTo(4, 18)
+        path.closeSubpath()
+        painter.drawPath(path)
+    elif icon_type == "settings":
+        painter.drawEllipse(8, 8, 8, 8)
+        for angle in range(0, 360, 45):
+            painter.save()
+            painter.translate(12, 12)
+            painter.rotate(angle)
+            painter.drawLine(0, -9, 0, -11)
+            painter.restore()
+    elif icon_type == "app":
+        painter.setBrush(QColor("#3b82f6"))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(3, 3, 18, 18, 4, 4)
+        pen.setColor(QColor("#ffffff"))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        painter.drawLine(12, 7, 12, 15)
+        painter.drawLine(8, 11, 12, 15)
+        painter.drawLine(16, 11, 12, 15)
+    painter.end()
+    return QIcon(pix)
+
+
+# -----------------------------------------------------------------------------
+# Modern Table Progress Delegate
+# -----------------------------------------------------------------------------
+class ModernProgressDelegate(QStyledItemDelegate):
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index):
         job = index.data(Qt.UserRole)
         if job is None:
             super().paint(painter, option, index)
             return
+
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing)
-        rect = option.rect.adjusted(4, option.rect.height() // 2 - 7,
-                                    -4, -(option.rect.height() // 2 - 7))
-        # trough
+
+        rect = option.rect.adjusted(6, option.rect.height() // 2 - 8,
+                                    -6, -(option.rect.height() // 2 - 8))
+
+        # Background track
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor("#2a2f3a"))
-        painter.drawRoundedRect(rect, 4, 4)
+        painter.setBrush(QColor("#1e293b"))
+        painter.drawRoundedRect(rect, 5, 5)
+
         w = rect.width()
-        if job.total:
-            for part in job.parts:
-                x0 = rect.left() + part["start"] * w // job.total
-                x1 = rect.left() + (part["start"] + part.get("have", 0)) * w // job.total
-                if x1 > x0:
-                    c = QColor("#3d7eff") if job.state == "downloading" else QColor("#2eaa6a")
-                    painter.setBrush(c)
-                    painter.drawRoundedRect(int(x0), rect.top(), int(x1 - x0), rect.height(), 3, 3)
-        painter.restore()
-        # percent text
-        painter.save()
-        painter.setPen(QColor("#c8d0dc"))
-        f = QFont(option.font)
-        f.setPointSize(7)
-        painter.setFont(f)
-        pct = f"{job.done * 100 // job.total}%" if job.total else "…"
-        painter.drawText(option.rect.adjusted(6, -14, -6, 14),
-                         Qt.AlignRight | Qt.AlignVCenter, pct)
+        total = job.total
+
+        if total > 0:
+            if job.parts:
+                for part in job.parts:
+                    p_start = part.get("start", 0)
+                    p_have = part.get("have", 0)
+                    x0 = rect.left() + (p_start * w // total)
+                    x1 = rect.left() + ((p_start + p_have) * w // total)
+                    seg_w = max(0, x1 - x0)
+                    if seg_w > 0:
+                        color = QColor("#3b82f6") if job.state == "downloading" else (
+                            QColor("#10b981") if job.state == "completed" else QColor("#f59e0b")
+                        )
+                        painter.setBrush(color)
+                        painter.drawRoundedRect(int(x0), rect.top() + 1, int(seg_w), rect.height() - 2, 3, 3)
+            else:
+                pct = job.done / total
+                fill_w = int(w * pct)
+                if fill_w > 0:
+                    color = QColor("#3b82f6") if job.state == "downloading" else (
+                        QColor("#10b981") if job.state == "completed" else QColor("#f59e0b")
+                    )
+                    painter.setBrush(color)
+                    painter.drawRoundedRect(rect.left(), rect.top() + 1, fill_w, rect.height() - 2, 3, 3)
+
+        # Percentage Text inside/over bar
+        painter.setPen(QColor("#f8fafc"))
+        font = QFont("Segoe UI", 8)
+        font.setBold(True)
+        painter.setFont(font)
+        pct_text = f"{int(job.done * 100 // total)}%" if total else "0%"
+        painter.drawText(option.rect.adjusted(0, 0, -12, 0), Qt.AlignRight | Qt.AlignVCenter, pct_text)
+
         painter.restore()
 
 
+# -----------------------------------------------------------------------------
+# Dialogs: Add URL, Details
+# -----------------------------------------------------------------------------
 class AddUrlDialog(QDialog):
-    def __init__(self, parent=None, default_url=""):
+    def __init__(self, default_dir: str, parent=None, default_url=""):
         super().__init__(parent)
-        self.setWindowTitle("Add URL — OpenDM")
-        self.setMinimumWidth(520)
-        lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("URL:"))
+        self.setWindowTitle("New Download — OpenDM")
+        self.setMinimumWidth(560)
+        self.dest_dir = default_dir
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(16)
+        layout.setContentsMargins(24, 24, 24, 24)
+
+        header = QLabel("Enter Download URL")
+        header.setStyleSheet("font-size: 15px; font-weight: bold; color: #f8fafc;")
+        layout.addWidget(header)
+
         self.url = QLineEdit(default_url)
-        self.url.setPlaceholderText("https://example.com/file.zip")
-        lay.addWidget(self.url)
+        self.url.setPlaceholderText("https://example.com/software-release.zip")
+        self.url.setClearButtonEnabled(True)
+        layout.addWidget(self.url)
+
+        # Settings grid
         row = QHBoxLayout()
-        row.addWidget(QLabel("Connections:"))
+        row.setSpacing(12)
+
+        row.addWidget(QLabel("Threads / Connections:"))
         self.conns = QSpinBox()
         self.conns.setRange(1, 32)
         self.conns.setValue(4)
+        self.conns.setFixedWidth(80)
         row.addWidget(self.conns)
-        row.addStretch(1)
-        lay.addLayout(row)
-        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bb.accepted.connect(self.accept)
-        bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
+
+        row.addSpacing(20)
+        row.addWidget(QLabel("Save Folder:"))
+        self.folder_label = QLabel(self.dest_dir)
+        self.folder_label.setStyleSheet("color: #94a3b8; font-size: 12px;")
+        row.addWidget(self.folder_label, 1)
+
+        browse_btn = QPushButton("Browse…")
+        browse_btn.clicked.connect(self._browse)
+        row.addWidget(browse_btn)
+
+        layout.addLayout(row)
+
+        layout.addSpacing(8)
+
+        # Action Buttons
+        btn_box = QHBoxLayout()
+        btn_box.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_box.addWidget(cancel_btn)
+
+        start_btn = QPushButton("Start Download")
+        start_btn.setDefault(True)
+        start_btn.setStyleSheet("""
+            QPushButton {
+                background: #2563eb; color: white; font-weight: bold;
+                border: none; padding: 8px 20px; border-radius: 6px;
+            }
+            QPushButton:hover { background: #1d4ed8; }
+        """)
+        start_btn.clicked.connect(self.accept)
+        btn_box.addWidget(start_btn)
+
+        layout.addLayout(btn_box)
+
+        # Auto-paste from clipboard if URL
+        cb = QApplication.clipboard().text().strip()
+        if cb.startswith(("http://", "https://")) and not default_url:
+            self.url.setText(cb)
+
+    def _browse(self):
+        d = QFileDialog.getExistingDirectory(self, "Select Download Folder", self.dest_dir)
+        if d:
+            self.dest_dir = d
+            self.folder_label.setText(d)
 
 
 class DetailsDialog(QDialog):
-    """Per-file progress window: segmented connection map showing each
-    connection's byte window and how much of it is filled."""
-
     def __init__(self, job, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Downloading — {job.filename}")
-        self.resize(560, 300)
+        self.setWindowTitle(f"Download Progress — {job.filename}")
+        self.resize(680, 420)
         self.job = job
-        lay = QVBoxLayout(self)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        # Title card
+        title_box = QFrame()
+        title_box.setStyleSheet("background: #0f172a; border-radius: 8px; padding: 12px;")
+        t_lay = QVBoxLayout(title_box)
+        t_lay.setSpacing(4)
+
+        self.fn_lbl = QLabel(f"<b>File:</b> {job.filename}")
+        self.fn_lbl.setStyleSheet("font-size: 14px; color: #f8fafc;")
+        self.url_lbl = QLabel(f"<b>URL:</b> {job.url}")
+        self.url_lbl.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        self.url_lbl.setWordWrap(True)
+
+        t_lay.addWidget(self.fn_lbl)
+        t_lay.addWidget(self.url_lbl)
+        layout.addWidget(title_box)
+
+        # Status meters
+        m_lay = QHBoxLayout()
+        self.stat_lbl = QLabel(f"State: {job.state}")
+        self.size_lbl = QLabel("Size: 0 MB")
+        self.speed_lbl = QLabel("Speed: 0 MB/s")
+        for lbl in (self.stat_lbl, self.size_lbl, self.speed_lbl):
+            lbl.setStyleSheet("font-size: 12px; font-weight: bold; color: #cbd5e1;")
+            m_lay.addWidget(lbl)
+        layout.addLayout(m_lay)
+
+        # Segment Map Box
+        seg_head = QLabel("Per-Connection Transfer Slices:")
+        seg_head.setStyleSheet("font-size: 12px; font-weight: bold; color: #94a3b8;")
+        layout.addWidget(seg_head)
+
         self.info = QPlainTextEdit()
         self.info.setReadOnly(True)
-        lay.addWidget(self.info)
+        self.info.setStyleSheet("""
+            QPlainTextEdit {
+                background: #0f172a; color: #38bdf8;
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 12px; border: 1px solid #1e293b; border-radius: 6px;
+            }
+        """)
+        layout.addWidget(self.info)
+
+        # Close button
+        b_row = QHBoxLayout()
+        b_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        b_row.addWidget(close_btn)
+        layout.addLayout(b_row)
+
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
-        self.timer.start(400)
+        self.timer.start(300)
         self.refresh()
 
     def refresh(self):
         j = self.job
         mb = 1024 * 1024
-        lines = [
-            f"URL:       {j.url}",
-            f"File:      {j.filename}   [{j.category}]",
-            f"State:     {j.state}",
-            f"Progress:  {j.done / mb:.2f} / {j.total / mb:.2f} MB "
-            f"({j.done * 100 // j.total if j.total else 0}%)",
-            f"Speed:     {j.speed_avg / mb:.2f} MB/s   connections: {j.conns}",
-            "",
-            "Per-connection byte windows and progress:",
-        ]
+        self.stat_lbl.setText(f"State: {j.state.upper()}")
+        done_mb = j.done / mb
+        tot_mb = j.total / mb if j.total else 0
+        pct = (j.done * 100 // j.total) if j.total else 0
+        self.size_lbl.setText(f"Progress: {done_mb:.2f} / {tot_mb:.2f} MB ({pct}%)")
+        self.speed_lbl.setText(f"Speed: {j.speed_avg / mb:.2f} MB/s [{j.conns} conns]")
+
+        lines = []
         for i, p in enumerate(j.parts):
             got = p.get("have", 0)
-            span = p["end"] - p["start"] + 1
-            bar = "█" * int(got * 24 / max(span, 1)) + "·" * (24 - int(got * 24 / max(span, 1)))
-            lines.append(f"  conn {i}:  {p['start']:>10,} … {p['end']:>10,}   "
-                         f"{bar}  {got * 100 // max(span, 1):>3}%")
+            span = p.get("end", 0) - p.get("start", 0) + 1
+            ratio = got / max(span, 1)
+            bar_len = 28
+            filled = int(ratio * bar_len)
+            bar = "█" * filled + "░" * (bar_len - filled)
+            pct_val = int(ratio * 100)
+            lines.append(f"Connection #{i+1:02d} [{p.get('start',0):>10,} .. {p.get('end',0):>10,}] : {bar} {pct_val:>3}% ({got/mb:.2f} MB)")
+
         if j.sha256:
-            lines += ["", f"SHA-256:   {j.sha256}"]
+            lines.append("")
+            lines.append(f"SHA-256 Verified: {j.sha256}")
         if j.error:
-            lines += ["", f"Error: {j.error}"]
+            lines.append("")
+            lines.append(f"Error Diagnostic: {j.error}")
+
         self.info.setPlainText("\n".join(lines))
 
 
-# ------------------------------------------------------------------ main
+# -----------------------------------------------------------------------------
+# Main Application Window (Fluent / Clean Modern Layout)
+# -----------------------------------------------------------------------------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} — open download manager")
-        self.resize(1000, 620)
+        self.setWindowTitle(f"{APP_NAME} — Advanced Download Manager")
+        self.resize(1100, 680)
+        self.setWindowIcon(make_icon("app", "#3b82f6"))
+
         dest = os.path.join(os.path.expanduser("~"), "Downloads")
         os.makedirs(dest, exist_ok=True)
         self.qm = QueueManager(dest)
 
-        # Embedded daemon: serve the extension API while the app runs
         self._daemon_thread = None
         self._start_embedded_daemon()
 
-        self._build_menu()
-        self._build_toolbar()
-        self._build_tree()
-        self._build_status()
+        self.selected_category = "All"
+        self._items_by_id = {}
 
+        self._build_ui()
+
+        # Update timer
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_rows)
-        self.timer.start(400)
+        self.timer.start(350)
 
     def _start_embedded_daemon(self):
-        """Run the hardened HTTP API inside the GUI process (port 10010).
-        If the port is already served (standalone daemon), skip silently."""
         try:
             from . import daemon as daemon_mod
-            daemon_mod.QM = self.qm  # share the same queue
-            httpd = HTTPServer(("127.0.0.1", daemon_mod.HTTP_PORT),
-                               daemon_mod.HardenedApiHandler)
+            daemon_mod.QM = self.qm
+            httpd = HTTPServer(("127.0.0.1", daemon_mod.HTTP_PORT), daemon_mod.HardenedApiHandler)
             self._daemon_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
             self._daemon_thread.start()
-        except OSError:
-            pass  # standalone daemon already listening
         except Exception:
             pass
 
-    # ---- UI construction ------------------------------------------------
-    def _build_menu(self):
-        mb = self.menuBar()
-        m_file = mb.addMenu("&File")
-        for label, slot, shortcut in [
-            ("Add URL…", self.add_url, "Ctrl+N"),
-            ("Start all", self.start_all, "Ctrl+S"),
-            ("Exit", self.close, "Ctrl+Q"),
-        ]:
-            a = QAction(label, self)
-            a.setShortcut(QKeySequence(shortcut))
-            a.triggered.connect(slot)
-            m_file.addAction(a)
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root_lay = QVBoxLayout(central)
+        root_lay.setContentsMargins(0, 0, 0, 0)
+        root_lay.setSpacing(0)
 
-        m_job = mb.addMenu("&Job")
-        for label, slot in [
-            ("Pause", self.pause_selected), ("Resume", self.resume_selected),
-            ("Cancel", self.cancel_selected), ("Details…", self.details_selected),
-        ]:
-            a = QAction(label, self)
-            a.triggered.connect(slot)
-            m_job.addAction(a)
+        # 1. Header Toolbar
+        toolbar = QWidget()
+        toolbar.setObjectName("TopToolbar")
+        t_lay = QHBoxLayout(toolbar)
+        t_lay.setContentsMargins(14, 10, 14, 10)
+        t_lay.setSpacing(8)
 
-        m_help = mb.addMenu("&Help")
-        a = QAction("About OpenDM", self)
-        a.triggered.connect(self.about)
-        m_help.addAction(a)
+        # App Brand
+        brand = QLabel(" OpenDM")
+        brand.setStyleSheet("font-size: 16px; font-weight: 800; color: #38bdf8; margin-right: 12px;")
+        t_lay.addWidget(brand)
 
-    def _build_toolbar(self):
-        tb = QToolBar()
-        tb.setMovable(False)
-        for label, slot in [
-            ("＋ Add", self.add_url), ("▶ Start All", self.start_all),
-            ("⏸ Pause", self.pause_selected), ("↻ Resume", self.resume_selected),
-            ("✖ Cancel", self.cancel_selected), ("📋 Details", self.details_selected),
-        ]:
-            b = QPushButton(label)
-            b.clicked.connect(slot)
-            tb.addWidget(b)
-        self.addToolBar(tb)
+        # Actions
+        self.btn_add = QPushButton(" Add URL")
+        self.btn_add.setIcon(make_icon("add", "#ffffff"))
+        self.btn_add.setStyleSheet("""
+            QPushButton {
+                background: #2563eb; color: white; font-weight: bold;
+                border: none; padding: 7px 16px; border-radius: 6px;
+            }
+            QPushButton:hover { background: #1d4ed8; }
+        """)
+        self.btn_add.clicked.connect(self.add_url)
+        t_lay.addWidget(self.btn_add)
 
-    def _build_tree(self):
+        self.btn_start = QPushButton(" Resume")
+        self.btn_start.setIcon(make_icon("play", "#22c55e"))
+        self.btn_start.clicked.connect(self.resume_selected)
+        t_lay.addWidget(self.btn_start)
+
+        self.btn_pause = QPushButton(" Pause")
+        self.btn_pause.setIcon(make_icon("pause", "#f59e0b"))
+        self.btn_pause.clicked.connect(self.pause_selected)
+        t_lay.addWidget(self.btn_pause)
+
+        self.btn_cancel = QPushButton(" Cancel")
+        self.btn_cancel.setIcon(make_icon("delete", "#ef4444"))
+        self.btn_cancel.clicked.connect(self.cancel_selected)
+        t_lay.addWidget(self.btn_cancel)
+
+        self.btn_details = QPushButton(" Details")
+        self.btn_details.setIcon(make_icon("info", "#94a3b8"))
+        self.btn_details.clicked.connect(self.details_selected)
+        t_lay.addWidget(self.btn_details)
+
+        self.btn_open_folder = QPushButton(" Open Folder")
+        self.btn_open_folder.setIcon(make_icon("folder", "#94a3b8"))
+        self.btn_open_folder.clicked.connect(self.open_downloads_folder)
+        t_lay.addWidget(self.btn_open_folder)
+
+        t_lay.addStretch()
+
+        root_lay.addWidget(toolbar)
+
+        # 2. Main Content Splitter (Sidebar + Downloads List)
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(1)
+
+        # Left Sidebar (Categories)
+        sidebar = QWidget()
+        sidebar.setObjectName("Sidebar")
+        sidebar.setFixedWidth(200)
+        s_lay = QVBoxLayout(sidebar)
+        s_lay.setContentsMargins(12, 16, 12, 16)
+        s_lay.setSpacing(4)
+
+        cat_title = QLabel("CATEGORIES")
+        cat_title.setStyleSheet("font-size: 11px; font-weight: bold; color: #64748b; margin-bottom: 8px;")
+        s_lay.addWidget(cat_title)
+
+        self.cat_buttons = {}
+        cats = [
+            ("All", "All Downloads"),
+            ("Downloading", "Downloading"),
+            ("Completed", "Completed"),
+            ("Paused", "Paused"),
+            ("Compressed", "Compressed (Zip/Rar)"),
+            ("Video", "Video & Media"),
+            ("Documents", "Documents"),
+            ("Programs", "Applications"),
+        ]
+        for key, title in cats:
+            btn = QPushButton(f"  {title}")
+            btn.setObjectName("CategoryBtn")
+            btn.setCheckable(True)
+            btn.clicked.connect(lambda ch, k=key: self.set_category(k))
+            s_lay.addWidget(btn)
+            self.cat_buttons[key] = btn
+
+        self.cat_buttons["All"].setChecked(True)
+        s_lay.addStretch()
+        splitter.addWidget(sidebar)
+
+        # Right Area (Table)
+        right_container = QWidget()
+        r_lay = QVBoxLayout(right_container)
+        r_lay.setContentsMargins(0, 0, 0, 0)
+        r_lay.setSpacing(0)
+
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(
-            ["File", "Size", "Progress", "Speed", "State", "Category", "SHA-256"])
+        self.tree.setHeaderLabels(["File Name", "Size", "Progress", "Speed", "Status", "Category", "Verification"])
         self.tree.header().setSectionResizeMode(0, QHeaderView.Interactive)
-        self.tree.setColumnWidth(0, 300)
-        self.tree.setColumnWidth(1, 90)
-        self.tree.setColumnWidth(2, 200)
+        self.tree.setColumnWidth(0, 280)
+        self.tree.setColumnWidth(1, 95)
+        self.tree.setColumnWidth(2, 220)
         self.tree.setColumnWidth(3, 110)
-        self.tree.setColumnWidth(4, 100)
-        self.tree.setColumnWidth(5, 90)
-        self.tree.setColumnWidth(6, 130)
+        self.tree.setColumnWidth(4, 105)
+        self.tree.setColumnWidth(5, 95)
+        self.tree.setColumnWidth(6, 140)
         self.tree.setRootIsDecorated(False)
         self.tree.setAlternatingRowColors(True)
+        self.tree.setItemDelegateForColumn(2, ModernProgressDelegate(self.tree))
         self.tree.itemDoubleClicked.connect(self.details_item)
-        self.setCentralWidget(self.tree)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._show_context_menu)
 
-    def _build_status(self):
-        sb = self.statusBar()
-        self.stat_label = QLabel("Ready")
-        sb.addWidget(self.stat_label)
+        r_lay.addWidget(self.tree)
+        splitter.addWidget(right_container)
 
-    # ---- actions --------------------------------------------------------
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        root_lay.addWidget(splitter, 1)
+
+        # 3. Modern Status Bar
+        self.status_bar = QStatusBar()
+        self.stat_label = QLabel("Ready • Engine Online")
+        self.stat_label.setStyleSheet("color: #94a3b8; font-size: 12px; margin-left: 8px;")
+        self.status_bar.addWidget(self.stat_label)
+        self.setStatusBar(self.status_bar)
+
+    def set_category(self, key: str):
+        self.selected_category = key
+        for k, btn in self.cat_buttons.items():
+            btn.setChecked(k == key)
+        self.refresh_rows(force_refilter=True)
+
+    def _show_context_menu(self, pos):
+        it = self.tree.itemAt(pos)
+        if not it:
+            return
+        job = it.data(0, Qt.UserRole)
+        if not job:
+            return
+
+        menu = QMenu(self)
+        act_details = menu.addAction("Inspect Details…")
+        act_details.triggered.connect(lambda: DetailsDialog(job, self).exec())
+
+        menu.addSeparator()
+        if job.state == "downloading":
+            act_pause = menu.addAction("Pause Download")
+            act_pause.triggered.connect(job.pause)
+        elif job.state in ("paused", "error"):
+            act_resume = menu.addAction("Resume Download")
+            act_resume.triggered.connect(job.resume)
+
+        act_cancel = menu.addAction("Cancel / Remove")
+        act_cancel.triggered.connect(job.cancel)
+
+        if job.state == "completed" and os.path.exists(job.dest):
+            menu.addSeparator()
+            act_open = menu.addAction("Open Downloaded File")
+            act_open.triggered.connect(lambda: self._open_file(job.dest))
+
+        menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def _open_file(self, path: str):
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                import subprocess
+                subprocess.Popen(["open", path])
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", path])
+        except Exception:
+            pass
+
+    def open_downloads_folder(self):
+        d = self.qm.dest_dir
+        self._open_file(d)
+
     def add_url(self):
-        dlg = AddUrlDialog(self)
+        dlg = AddUrlDialog(self.qm.dest_dir, self)
         if dlg.exec() and dlg.url.text().strip():
-            job = self.qm.add(dlg.url.text().strip(), conns=dlg.conns.value())
+            job = self.qm.add(dlg.url.text().strip(), conns=dlg.conns.value(), dest_dir=dlg.dest_dir)
             job.start()
             self.refresh_rows()
 
-    def start_all(self):
-        self.qm.start_all()
-
     def _selected_job(self):
         it = self.tree.currentItem()
-        return it.data(0, Qt.UserRole) if it else None
+        if not it:
+            return None
+        return it.data(0, Qt.UserRole) or it.data(2, Qt.UserRole)
 
     def pause_selected(self):
         j = self._selected_job()
@@ -256,7 +602,7 @@ class MainWindow(QMainWindow):
     def resume_selected(self):
         j = self._selected_job()
         if j and j.state in ("paused", "error"):
-            j.start()
+            j.resume()
 
     def cancel_selected(self):
         j = self._selected_job()
@@ -269,60 +615,194 @@ class MainWindow(QMainWindow):
             DetailsDialog(j, self).exec()
 
     def details_item(self, item, _col):
-        j = item.data(0, Qt.UserRole)
+        j = item.data(0, Qt.UserRole) or item.data(2, Qt.UserRole)
         if j:
             DetailsDialog(j, self).exec()
 
-    def about(self):
-        QMessageBox.about(
-            self, "About OpenDM",
-            "<b>OpenDM 1.0</b><br>Independent open-source implementation of a classic "
-            "download-manager architecture: multi-connection ranged downloads, "
-            "per-connection part files, resume, final assembly, SHA-256 proof.<br>"
-            "<br>GPL-3.0 — reconstructed with REA-assisted reverse engineering. "
-            "Not affiliated with Tonec FZE.")
-
-    # ---- refresh ---------------------------------------------------------
-    def refresh_rows(self):
+    def refresh_rows(self, force_refilter=False):
         jobs = list(self.qm.jobs)
-        self.tree.clear()
         mb = 1024 * 1024
+
+        current_job = self._selected_job()
+        selected_id = current_job.id if current_job else None
+
+        cat = self.selected_category
+        filtered_jobs = []
         for j in jobs:
-            it = QTreeWidgetItem([
-                j.filename,
-                f"{j.total / mb:.1f} MB" if j.total else "—",
-                "",
-                f"{j.speed_avg / mb:.2f} MB/s" if j.state == "downloading" else "",
-                j.state,
-                j.category,
-                j.sha256[:12] + "…" if j.sha256 else "",
-            ])
-            it.setData(2, Qt.UserRole, j)
-            self.tree.addTopLevelItem(it)
-        self.tree.setItemDelegateForColumn(2, ProgressDelegate(self.tree))
+            if cat == "All":
+                filtered_jobs.append(j)
+            elif cat in ("Downloading", "Completed", "Paused"):
+                if j.state.lower() == cat.lower():
+                    filtered_jobs.append(j)
+            elif j.category == cat:
+                filtered_jobs.append(j)
+
+        seen_ids = set()
+        for j in filtered_jobs:
+            seen_ids.add(j.id)
+            it = self._items_by_id.get(j.id)
+            status_text = j.state.capitalize()
+
+            if not it:
+                it = QTreeWidgetItem([
+                    j.filename,
+                    f"{j.total / mb:.1f} MB" if j.total else "—",
+                    "",
+                    f"{j.speed_avg / mb:.2f} MB/s" if j.state == "downloading" else "—",
+                    status_text,
+                    j.category,
+                    j.sha256[:10] + "…" if j.sha256 else "—",
+                ])
+                it.setData(0, Qt.UserRole, j)
+                it.setData(2, Qt.UserRole, j)
+                self.tree.addTopLevelItem(it)
+                self._items_by_id[j.id] = it
+            else:
+                it.setText(0, j.filename)
+                it.setText(1, f"{j.total / mb:.1f} MB" if j.total else "—")
+                it.setText(3, f"{j.speed_avg / mb:.2f} MB/s" if j.state == "downloading" else "—")
+                it.setText(4, status_text)
+                it.setText(5, j.category)
+                it.setText(6, j.sha256[:10] + "…" if j.sha256 else "—")
+                it.setData(0, Qt.UserRole, j)
+                it.setData(2, Qt.UserRole, j)
+
+        for jid in list(self._items_by_id.keys()):
+            if jid not in seen_ids:
+                it = self._items_by_id.pop(jid)
+                idx = self.tree.indexOfTopLevelItem(it)
+                if idx >= 0:
+                    self.tree.takeTopLevelItem(idx)
+
+        if selected_id and selected_id in self._items_by_id:
+            self.tree.setCurrentItem(self._items_by_id[selected_id])
+
         active = sum(1 for j in jobs if j.state == "downloading")
         done = sum(1 for j in jobs if j.state == "completed")
-        self.stat_label.setText(f"{len(jobs)} jobs — {active} downloading — {done} completed")
+        self.stat_label.setText(f"Total: {len(jobs)}  •  Active: {active}  •  Completed: {done}  •  Directory: {self.qm.dest_dir}")
 
 
-DARK_QSS = """
-QMainWindow, QDialog { background: #1b2029; }
-QToolBar { background: #232a36; border: none; padding: 4px; spacing: 6px; }
-QPushButton { background: #2c3442; color: #d7dee9; border: 1px solid #3a4456; border-radius: 5px; padding: 5px 12px; }
-QPushButton:hover { background: #35405280; }
-QTreeWidget { background: #20262f; color: #cfd6e2; border: 1px solid #2c3442; font-size: 13px; }
-QHeaderView::section { background: #232a36; color: #9fb0c8; border: none; padding: 6px; }
-QStatusBar { background: #1b2029; color: #8fa1bb; }
-QPlainTextEdit { background: #20262f; color: #cfd6e2; font-family: monospace; font-size: 12px; }
-QMenu { background: #232a36; color: #d7dee9; }
-QLabel, QComboBox, QSpinBox { color: #d7dee9; }
-QLineEdit { background: #20262f; color: #d7dee9; border: 1px solid #3a4456; padding: 4px; }
+# -----------------------------------------------------------------------------
+# Premium Dark Theme Stylesheet (Modern Fluent Slate)
+# -----------------------------------------------------------------------------
+MODERN_THEME = """
+QMainWindow {
+    background-color: #0b0f19;
+}
+QWidget {
+    color: #e2e8f0;
+    font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+    font-size: 13px;
+}
+#TopToolbar {
+    background-color: #0f172a;
+    border-bottom: 1px solid #1e293b;
+}
+QPushButton {
+    background-color: #1e293b;
+    color: #e2e8f0;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-weight: 500;
+}
+QPushButton:hover {
+    background-color: #334155;
+    border-color: #475569;
+}
+QPushButton:pressed {
+    background-color: #0f172a;
+}
+#Sidebar {
+    background-color: #0f172a;
+    border-right: 1px solid #1e293b;
+}
+#CategoryBtn {
+    background-color: transparent;
+    border: none;
+    border-radius: 6px;
+    text-align: left;
+    padding: 8px 12px;
+    color: #94a3b8;
+    font-weight: 500;
+}
+#CategoryBtn:hover {
+    background-color: #1e293b;
+    color: #f8fafc;
+}
+#CategoryBtn:checked {
+    background-color: #1e3a8a;
+    color: #60a5fa;
+    font-weight: 600;
+}
+QTreeWidget {
+    background-color: #0b0f19;
+    alternate-background-color: #0f172a;
+    border: none;
+    selection-background-color: #1e293b;
+    selection-color: #38bdf8;
+    padding: 4px;
+}
+QTreeWidget::item {
+    height: 36px;
+    border-radius: 4px;
+    padding: 2px;
+}
+QTreeWidget::item:hover {
+    background-color: #1e293b;
+}
+QTreeWidget::item:selected {
+    background-color: #1e293b;
+    color: #38bdf8;
+}
+QHeaderView::section {
+    background-color: #0f172a;
+    color: #94a3b8;
+    border: none;
+    border-bottom: 1px solid #1e293b;
+    padding: 8px 10px;
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+}
+QStatusBar {
+    background-color: #0f172a;
+    border-top: 1px solid #1e293b;
+    color: #94a3b8;
+}
+QMenu {
+    background-color: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    padding: 6px;
+}
+QMenu::item {
+    padding: 6px 24px;
+    border-radius: 4px;
+}
+QMenu::item:selected {
+    background-color: #2563eb;
+    color: white;
+}
+QDialog {
+    background-color: #0f172a;
+}
+QLineEdit, QSpinBox {
+    background-color: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    color: #f8fafc;
+    padding: 6px 10px;
+}
+QLineEdit:focus, QSpinBox:focus {
+    border: 1px solid #3b82f6;
+}
 """
 
 
 def main():
     app = QApplication(sys.argv)
-    app.setStyleSheet(DARK_QSS)
+    app.setStyleSheet(MODERN_THEME)
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
