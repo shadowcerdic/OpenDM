@@ -81,9 +81,14 @@ def plan_ranges(total: int, n: int) -> list[tuple[int, int]]:
 
 
 def _fetch_chunk(url: str, start: int, end: int, part_path: str,
-                 stop_event=None, on_bytes=None, extra_headers: dict | None = None) -> int:
-    """Fetch [start, end] into part_path; resumes from current part size."""
-    for _attempt in range(2):
+                 stop_event=None, on_bytes=None, extra_headers: dict | None = None,
+                 max_retries: int = 5) -> int:
+    """Fetch [start, end] into part_path; resumes from current part size with auto-retry."""
+    attempt = 0
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            raise Paused()
+
         have = os.path.getsize(part_path) if os.path.exists(part_path) else 0
         if have > (end - start + 1):
             with open(part_path, "r+b") as f:
@@ -99,41 +104,55 @@ def _fetch_chunk(url: str, start: int, end: int, part_path: str,
                 if k.lower() in ("cookie", "referer", "user-agent", "authorization"):
                     hdrs[k] = v
 
-        req = urllib.request.Request(url, headers=hdrs)
-        with urllib.request.urlopen(req, timeout=30) as r:
-            if r.status not in (200, 206):
-                raise RuntimeError(f"unexpected status {r.status}")
-            if r.status == 200 and have:
-                os.remove(part_path)
-                continue
-            if r.status == 200 and not have:
-                remaining = end - start + 1
-                with open(part_path, "wb") as f:
-                    while remaining > 0:
+        try:
+            req = urllib.request.Request(url, headers=hdrs)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                if r.status not in (200, 206):
+                    raise RuntimeError(f"unexpected status {r.status}")
+                if r.status == 200 and have:
+                    os.remove(part_path)
+                    attempt += 1
+                    continue
+                if r.status == 200 and not have:
+                    remaining = end - start + 1
+                    with open(part_path, "wb") as f:
+                        while remaining > 0:
+                            if stop_event is not None and stop_event.is_set():
+                                raise Paused()
+                            buf = r.read(min(65536, remaining))
+                            if not buf:
+                                break
+                            f.write(buf)
+                            have += len(buf)
+                            remaining -= len(buf)
+                            if on_bytes:
+                                on_bytes(len(buf))
+                    return have
+                with open(part_path, "ab") as f:
+                    while True:
                         if stop_event is not None and stop_event.is_set():
                             raise Paused()
-                        buf = r.read(min(65536, remaining))
+                        buf = r.read(65536)
                         if not buf:
                             break
                         f.write(buf)
                         have += len(buf)
-                        remaining -= len(buf)
                         if on_bytes:
                             on_bytes(len(buf))
-                return have
-            with open(part_path, "ab") as f:
-                while True:
-                    if stop_event is not None and stop_event.is_set():
-                        raise Paused()
-                    buf = r.read(65536)
-                    if not buf:
-                        break
-                    f.write(buf)
-                    have += len(buf)
-                    if on_bytes:
-                        on_bytes(len(buf))
-        return have
-    return have
+            return have
+        except Paused:
+            raise
+        except Exception as ex:
+            attempt += 1
+            if attempt > max_retries or (stop_event is not None and stop_event.is_set()):
+                raise RuntimeError(f"Network error after {attempt} attempts: {ex}")
+            # Exponential backoff with small sleep
+            backoff = min(2 ** attempt * 0.5, 5.0)
+            t_end = time.time() + backoff
+            while time.time() < t_end:
+                if stop_event is not None and stop_event.is_set():
+                    raise Paused()
+                time.sleep(0.2)
 
 
 def assemble(dest: str, total: int, parts: list[str]) -> str:

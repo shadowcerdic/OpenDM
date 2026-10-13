@@ -197,6 +197,16 @@ class HardenedApiHandler(BaseHTTPRequestHandler):
                         if k.lower() in ("cookie", "referer", "user-agent")}
 
         suggested = data.get("suggested_filename")
+        show_prompt = bool(data.get("show_dialog", True))
+
+        # Check if GUI registered an intercept prompt hook
+        on_prompt = getattr(QM, "on_new_download_request", None)
+        if on_prompt and show_prompt:
+            # Let GUI present the prompt to the user
+            threading.Thread(target=on_prompt, args=(url, conns, safe_headers, suggested), daemon=True).start()
+            self._send_json({"ok": True, "status": "prompted", "message": "Download confirmation shown in GUI"})
+            return
+
         job = QM.add(url, conns=conns, headers=safe_headers,
                      suggested_filename=suggested if isinstance(suggested, str) else None)
         job.start()

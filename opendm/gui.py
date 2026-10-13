@@ -7,8 +7,9 @@ Features:
 - Interactive context menus (right-click on rows)
 - Custom smooth progress bar delegate with connection slice visualization
 - Details modal with real-time per-connection visual segment map
-- Add Download dialog with auto-paste clipboard and path selection
-- Settings dialog (configurable download folder, max connections, speed limit)
+- Download Confirmation Prompt (Popup like IDM on new download)
+- Minimize to System Tray support with tray menu & background execution
+- Auto-retry network resiliency in engine
 - Embedded secure daemon
 """
 from __future__ import annotations
@@ -19,7 +20,7 @@ import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QSize, QRectF
+from PySide6.QtCore import Qt, QTimer, QSize, QRectF, Signal, QObject
 from PySide6.QtGui import (
     QAction, QColor, QIcon, QPainter, QFont, QPen, QBrush,
     QKeySequence, QPixmap, QPainterPath
@@ -29,11 +30,13 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QPushButton, QLabel, QMenu, QMenuBar,
     QLineEdit, QComboBox, QSpinBox, QDialog, QToolBar, QStatusBar,
     QHeaderView, QStyledItemDelegate, QStyleOptionViewItem, QMessageBox,
-    QFileDialog, QDialogButtonBox, QPlainTextEdit, QFrame, QSplitter
+    QFileDialog, QDialogButtonBox, QPlainTextEdit, QFrame, QSplitter,
+    QSystemTrayIcon
 )
 from http.server import HTTPServer
 
 from .queue import QueueManager, STATES
+from .sanitize import sanitize_filename
 
 APP_NAME = "OpenDM"
 DEFAULT_DOWNLOADS = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -94,14 +97,6 @@ def make_icon(icon_type: str, color: str = "#e2e8f0", size: int = 24) -> QIcon:
         path.lineTo(4, 18)
         path.closeSubpath()
         painter.drawPath(path)
-    elif icon_type == "settings":
-        painter.drawEllipse(8, 8, 8, 8)
-        for angle in range(0, 360, 45):
-            painter.save()
-            painter.translate(12, 12)
-            painter.rotate(angle)
-            painter.drawLine(0, -9, 0, -11)
-            painter.restore()
     elif icon_type == "app":
         painter.setBrush(QColor("#3b82f6"))
         painter.setPen(Qt.NoPen)
@@ -176,10 +171,10 @@ class ModernProgressDelegate(QStyledItemDelegate):
 
 
 # -----------------------------------------------------------------------------
-# Dialogs: Add URL, Details
+# Dialogs: Add URL, Details, Download Prompt (Like IDM)
 # -----------------------------------------------------------------------------
 class AddUrlDialog(QDialog):
-    def __init__(self, default_dir: str, parent=None, default_url=""):
+    def __init__(self, default_dir: str, parent=None, default_url="", suggested_name=""):
         super().__init__(parent)
         self.setWindowTitle("New Download — OpenDM")
         self.setMinimumWidth(560)
@@ -189,7 +184,7 @@ class AddUrlDialog(QDialog):
         layout.setSpacing(16)
         layout.setContentsMargins(24, 24, 24, 24)
 
-        header = QLabel("Enter Download URL")
+        header = QLabel("Enter Download Details")
         header.setStyleSheet("font-size: 15px; font-weight: bold; color: #f8fafc;")
         layout.addWidget(header)
 
@@ -197,6 +192,14 @@ class AddUrlDialog(QDialog):
         self.url.setPlaceholderText("https://example.com/software-release.zip")
         self.url.setClearButtonEnabled(True)
         layout.addWidget(self.url)
+
+        # Filename override
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("File Name:"))
+        self.fn_input = QLineEdit(suggested_name)
+        self.fn_input.setPlaceholderText("(auto-detected if blank)")
+        name_row.addWidget(self.fn_input)
+        layout.addLayout(name_row)
 
         # Settings grid
         row = QHBoxLayout()
@@ -220,7 +223,6 @@ class AddUrlDialog(QDialog):
         row.addWidget(browse_btn)
 
         layout.addLayout(row)
-
         layout.addSpacing(8)
 
         # Action Buttons
@@ -245,7 +247,6 @@ class AddUrlDialog(QDialog):
 
         layout.addLayout(btn_box)
 
-        # Auto-paste from clipboard if URL
         cb = QApplication.clipboard().text().strip()
         if cb.startswith(("http://", "https://")) and not default_url:
             self.url.setText(cb)
@@ -268,7 +269,6 @@ class DetailsDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(14)
 
-        # Title card
         title_box = QFrame()
         title_box.setStyleSheet("background: #0f172a; border-radius: 8px; padding: 12px;")
         t_lay = QVBoxLayout(title_box)
@@ -284,7 +284,6 @@ class DetailsDialog(QDialog):
         t_lay.addWidget(self.url_lbl)
         layout.addWidget(title_box)
 
-        # Status meters
         m_lay = QHBoxLayout()
         self.stat_lbl = QLabel(f"State: {job.state}")
         self.size_lbl = QLabel("Size: 0 MB")
@@ -294,7 +293,6 @@ class DetailsDialog(QDialog):
             m_lay.addWidget(lbl)
         layout.addLayout(m_lay)
 
-        # Segment Map Box
         seg_head = QLabel("Per-Connection Transfer Slices:")
         seg_head.setStyleSheet("font-size: 12px; font-weight: bold; color: #94a3b8;")
         layout.addWidget(seg_head)
@@ -310,7 +308,6 @@ class DetailsDialog(QDialog):
         """)
         layout.addWidget(self.info)
 
-        # Close button
         b_row = QHBoxLayout()
         b_row.addStretch()
         close_btn = QPushButton("Close")
@@ -355,6 +352,13 @@ class DetailsDialog(QDialog):
 
 
 # -----------------------------------------------------------------------------
+# Intercept Bridge for GUI Prompt Threading
+# -----------------------------------------------------------------------------
+class PromptBridge(QObject):
+    sig_prompt = Signal(str, int, dict, object)
+
+
+# -----------------------------------------------------------------------------
 # Main Application Window (Fluent / Clean Modern Layout)
 # -----------------------------------------------------------------------------
 class MainWindow(QMainWindow):
@@ -368,6 +372,11 @@ class MainWindow(QMainWindow):
         os.makedirs(dest, exist_ok=True)
         self.qm = QueueManager(dest)
 
+        # Connect GUI hook for download requests intercepted by daemon/extension
+        self.prompt_bridge = PromptBridge()
+        self.prompt_bridge.sig_prompt.connect(self._handle_prompt_in_main_thread)
+        self.qm.on_new_download_request = lambda u, c, h, s: self.prompt_bridge.sig_prompt.emit(u, c, h, s)
+
         self._daemon_thread = None
         self._start_embedded_daemon()
 
@@ -375,6 +384,7 @@ class MainWindow(QMainWindow):
         self._items_by_id = {}
 
         self._build_ui()
+        self._setup_system_tray()
 
         # Update timer
         self.timer = QTimer(self)
@@ -390,6 +400,69 @@ class MainWindow(QMainWindow):
             self._daemon_thread.start()
         except Exception:
             pass
+
+    def _setup_system_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray = QSystemTrayIcon(make_icon("app", "#3b82f6"), self)
+        tray_menu = QMenu()
+
+        act_show = tray_menu.addAction("Show OpenDM")
+        act_show.triggered.connect(self.showNormal)
+
+        act_add = tray_menu.addAction("Add New Download…")
+        act_add.triggered.connect(self.add_url)
+
+        tray_menu.addSeparator()
+        act_quit = tray_menu.addAction("Exit")
+        act_quit.triggered.connect(self._force_quit)
+
+        self.tray.setContextMenu(tray_menu)
+        self.tray.activated.connect(self._tray_activated)
+        self.tray.show()
+
+    def _tray_activated(self, reason):
+        if reason == QSystemTrayIcon.Trigger:
+            if self.isVisible():
+                self.hide()
+            else:
+                self.showNormal()
+                self.activateWindow()
+
+    def closeEvent(self, event):
+        """Minimize to system tray on close instead of killing active downloads."""
+        if hasattr(self, "tray") and self.tray.isVisible():
+            self.hide()
+            self.tray.showMessage(
+                "OpenDM Running in Background",
+                "Downloads and browser integration remain active in the system tray.",
+                QSystemTrayIcon.Information,
+                2000
+            )
+            event.ignore()
+        else:
+            event.accept()
+
+    def _force_quit(self):
+        QApplication.quit()
+
+    def _handle_prompt_in_main_thread(self, url, conns, headers, suggested):
+        """Opens a confirmation dialog on screen just like IDM does."""
+        self.showNormal()
+        self.activateWindow()
+        dlg = AddUrlDialog(self.qm.dest_dir, self, default_url=url, suggested_name=suggested or "")
+        dlg.conns.setValue(conns)
+        if dlg.exec():
+            final_name = dlg.fn_input.text().strip() or suggested
+            job = self.qm.add(
+                dlg.url.text().strip(),
+                conns=dlg.conns.value(),
+                dest_dir=dlg.dest_dir,
+                headers=headers,
+                suggested_filename=final_name
+            )
+            job.start()
+            self.refresh_rows()
 
     def _build_ui(self):
         central = QWidget()
@@ -449,7 +522,6 @@ class MainWindow(QMainWindow):
         t_lay.addWidget(self.btn_open_folder)
 
         t_lay.addStretch()
-
         root_lay.addWidget(toolbar)
 
         # 2. Main Content Splitter (Sidebar + Downloads List)
@@ -553,7 +625,7 @@ class MainWindow(QMainWindow):
         if job.state == "downloading":
             act_pause = menu.addAction("Pause Download")
             act_pause.triggered.connect(job.pause)
-        elif job.state in ("paused", "error"):
+        elif job.state in ("paused", "error", "queued"):
             act_resume = menu.addAction("Resume Download")
             act_resume.triggered.connect(job.resume)
 
@@ -587,7 +659,13 @@ class MainWindow(QMainWindow):
     def add_url(self):
         dlg = AddUrlDialog(self.qm.dest_dir, self)
         if dlg.exec() and dlg.url.text().strip():
-            job = self.qm.add(dlg.url.text().strip(), conns=dlg.conns.value(), dest_dir=dlg.dest_dir)
+            final_name = dlg.fn_input.text().strip() or None
+            job = self.qm.add(
+                dlg.url.text().strip(),
+                conns=dlg.conns.value(),
+                dest_dir=dlg.dest_dir,
+                suggested_filename=final_name
+            )
             job.start()
             self.refresh_rows()
 
