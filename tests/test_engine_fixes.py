@@ -909,3 +909,126 @@ def test_reported_rate_excludes_resumed_bytes(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Item 9: SafeRedirectHandler — strips Cookie/Authorization on cross-origin
+# redirects, allows only http/https targets; used by probe() and workers.
+# ---------------------------------------------------------------------------
+
+def test_safe_redirect_handler_exported():
+    import urllib.request
+    assert hasattr(engine, "SafeRedirectHandler")
+    assert issubclass(engine.SafeRedirectHandler,
+                      urllib.request.HTTPRedirectHandler)
+
+
+def test_cross_origin_redirect_strips_cookie_and_auth(tmp_path):
+    """Cookie/Authorization must not leak to a different origin via redirect."""
+    with make_server({}) as target:
+        with make_server({"redirect_to": target.url("/file.bin")}) as redir:
+            dest = str(tmp_path / "xredir.bin")
+            hdrs = {"Cookie": "s3cr3t-session",
+                    "Authorization": "Bearer hunter2",
+                    "Referer": "https://trusted.example/"}
+            res = engine.download(redir.url("/start"), dest=dest, conns=2,
+                                  headers=hdrs)
+            assert res["sha256"] == PAYLOAD_SHA256
+            seen = [r for r in target.requests
+                    if r["method"] == "GET" and r["path"] == "/file.bin"]
+            assert seen, "redirect target never received the request"
+            for r in seen:
+                assert "cookie" not in r["headers"], \
+                    f"Cookie leaked cross-origin: {r['headers'].get('cookie')}"
+                assert "authorization" not in r["headers"], \
+                    "Authorization leaked cross-origin"
+
+
+class _SameOriginRedirectHandler(http.server.BaseHTTPRequestHandler):
+    """302 /entry -> /file.bin on the same origin; records request headers."""
+    requests = []
+
+    def log_message(self, *a):
+        pass
+
+    def _record(self):
+        type(self).requests.append({
+            "method": self.command,
+            "path": self.path.split("?")[0],
+            "headers": {k.lower(): v for k, v in self.headers.items()},
+        })
+
+    def do_HEAD(self):
+        self._record()
+        if self.path == "/entry":
+            self.send_response(302)
+            self.send_header("Location", "/file.bin")
+        else:
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(PAYLOAD)))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("ETag", '"strong-1"')
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+    def do_GET(self):
+        self._record()
+        if self.path == "/entry":
+            self.send_response(302)
+            self.send_header("Location", "/file.bin")
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            return
+        rng = self.headers.get("Range") or ""
+        if rng.startswith("bytes="):
+            spec = rng.split("=", 1)[1]
+            a, b = spec.split("-", 1)
+            s, e = int(a), int(b) if b else len(PAYLOAD) - 1
+            data = PAYLOAD[s:e + 1]
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {s}-{e}/{len(PAYLOAD)}")
+            self.send_header("Content-Length", str(len(data)))
+        else:
+            data = PAYLOAD
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        self.close_connection = True
+
+
+def test_same_origin_redirect_keeps_headers(tmp_path):
+    """Same-origin redirects keep Cookie/Authorization (base behavior)."""
+    _SameOriginRedirectHandler.requests = []
+    srv, url = _serve_with(_SameOriginRedirectHandler)
+    try:
+        dest = str(tmp_path / "sredir.bin")
+        hdrs = {"Cookie": "s3cr3t-session", "Authorization": "Bearer hunter2"}
+        res = engine.download(url.replace("/file.bin", "/entry"), dest=dest,
+                              conns=1, headers=hdrs)
+        assert res["sha256"] == PAYLOAD_SHA256
+        seen = [r for r in _SameOriginRedirectHandler.requests
+                if r["method"] == "GET" and r["path"] == "/file.bin"]
+        assert seen, "redirect target never received the request"
+        assert seen[0]["headers"].get("cookie") == "s3cr3t-session"
+        assert seen[0]["headers"].get("authorization") == "Bearer hunter2"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_redirect_to_non_http_blocked():
+    """Redirect targets with non-http(s) schemes must be refused."""
+    import urllib.request
+    with make_server({"redirect_to": "ftp://evil.example/payload"}) as server:
+        opener = urllib.request.build_opener(engine.SafeRedirectHandler())
+        req = urllib.request.Request(server.url("/file.bin"))
+        with pytest.raises(Exception, match="(?i)non-http|blocked|redirect"):
+            opener.open(req, timeout=10)
+
+
+# ---------------------------------------------------------------------------

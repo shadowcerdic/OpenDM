@@ -216,6 +216,36 @@ class Segment:
         return cls(d["id"], d["start"], d["end"], d.get("cursor", d["start"]))
 
 
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Redirect handler that never leaks credentials cross-origin.
+
+    - Only http/https redirect targets are followed; anything else raises.
+    - When the redirect target differs from the request URL in scheme, host
+      or port, the Cookie and Authorization headers are stripped.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        absolute = urllib.parse.urljoin(req.full_url, newurl)
+        target = urllib.parse.urlparse(absolute)
+        if target.scheme not in ("http", "https"):
+            raise urllib.error.HTTPError(
+                absolute, code,
+                f"Blocked redirect to non-http(s) URL: {absolute!r}",
+                headers, fp,
+            )
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is None:
+            return None
+        orig = urllib.parse.urlparse(req.full_url)
+        if ((target.scheme, target.hostname, target.port)
+                != (orig.scheme, orig.hostname, orig.port)):
+            for name in ("Cookie", "Authorization"):
+                if new_req.has_header(name):
+                    new_req.remove_header(name)
+                new_req.unredirected_hdrs.pop(name, None)
+        return new_req
+
+
 def probe(url: str, extra_headers: dict | None = None, proxy: str | None = None) -> dict:
     """Probe server with HEAD request (falls back to Range: bytes=0-1). Supports HTTP/SOCKS5 proxy."""
     hdrs = {"User-Agent": UA}
@@ -224,7 +254,7 @@ def probe(url: str, extra_headers: dict | None = None, proxy: str | None = None)
             if k.lower() in ("cookie", "referer", "user-agent", "authorization"):
                 hdrs[k] = v
 
-    handlers = []
+    handlers = [SafeRedirectHandler()]
     if proxy:
         handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
     opener = urllib.request.build_opener(*handlers)
@@ -493,7 +523,7 @@ def _download_single_segment(
     abort_event: threading.Event | None = None,
 ):
     """Fetch assigned segment range directly writing to preallocated fd."""
-    handlers = []
+    handlers = [SafeRedirectHandler()]
     if proxy:
         handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
     opener = urllib.request.build_opener(*handlers)
