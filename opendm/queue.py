@@ -1,6 +1,7 @@
 """OpenDM download queue with persistent state (JSON) and sanitized paths."""
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import threading
@@ -126,6 +127,9 @@ class Job:
         # the terminal "canceled" state is never overwritten by a stale
         # Paused/exception handler. Cleared on every fresh start().
         self._cancel_requested = False
+        # Back-reference to the owning QueueManager (set by add()/_load());
+        # provides the manager's proxy and shared rate limiter to _run.
+        self._manager: QueueManager | None = None
 
     def start(self):
         # Canceled jobs are terminal: start() is a no-op for them, just
@@ -218,7 +222,37 @@ class Job:
             except Exception:
                 pass
 
+    def _engine_download_kwargs(self) -> dict:
+        """Resolve proxy/rate_limiter kwargs for engine.download.
+
+        Uses the owning manager's proxy and shared token bucket. Defensive
+        about the engine side (TokenBucket / download(rate_limiter=...)):
+        when a speed limit was requested but the engine rate-limiter
+        support has not landed, raises a clear RuntimeError instead of
+        silently downloading unlimited.
+        """
+        mgr = getattr(self, "_manager", None)
+        proxy = getattr(mgr, "proxy", None)
+        limiter = getattr(mgr, "token_bucket", None)
+        if limiter is None and getattr(mgr, "speed_limit", 0) > 0:
+            raise RuntimeError(
+                "speed limit requested but engine.TokenBucket is not "
+                "available (engine rate-limiter support has not landed yet)")
+        kwargs: dict = {"proxy": proxy}
+        if limiter is not None:
+            params = inspect.signature(engine.download).parameters
+            if ("rate_limiter" in params or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD
+                    for p in params.values())):
+                kwargs["rate_limiter"] = limiter
+            else:
+                raise RuntimeError(
+                    "engine.download() does not accept rate_limiter "
+                    "(engine rate-limiter support has not landed yet)")
+        return kwargs
+
     def _run(self):
+        kwargs = self._engine_download_kwargs()
         try:
             res = engine.download(
                 self.url,
@@ -228,6 +262,7 @@ class Job:
                 stop_event=self._stop,
                 parts_cb=self._parts,
                 headers=self.headers,
+                **kwargs,
             )
             self.sha256 = res.get("sha256")
             self.total = res.get("size", self.total)
@@ -305,7 +340,8 @@ class QueueManager:
     # across QueueManager instances sharing a directory.
     _dest_lock = threading.Lock()
 
-    def __init__(self, dest_dir: str, state_file: str | Path | None = None):
+    def __init__(self, dest_dir: str, state_file: str | Path | None = None,
+                 *, proxy: str | None = None, speed_limit: int = 0):
         self.dest_dir = dest_dir
         os.makedirs(dest_dir, exist_ok=True)
         self.jobs: list[Job] = []
@@ -313,6 +349,18 @@ class QueueManager:
         # In-process reservation set (absolute final paths) so two queued jobs
         # never pick the same destination even when nothing exists on disk yet.
         self._reserved: set[str] = set()
+
+        # Network settings shared by all jobs: an optional proxy URL and a
+        # global download speed limit (bytes/sec, 0 = unlimited) enforced by
+        # one shared token bucket. The bucket is created defensively: the
+        # engine side (engine.TokenBucket) may not have landed yet, in which
+        # case token_bucket stays None and _run raises a clear error only if
+        # a nonzero limit was actually requested.
+        self.proxy = proxy
+        self.speed_limit = max(0, int(speed_limit or 0))
+        _TokenBucket = getattr(engine, "TokenBucket", None)
+        self.token_bucket = (_TokenBucket(self.speed_limit)
+                             if _TokenBucket is not None else None)
 
         if state_file is None:
             base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
@@ -346,6 +394,7 @@ class QueueManager:
                 j.error = d.get("error")
                 j.dest = d.get("dest", j.dest)
                 j._on_change = self._save
+                j._manager = self
                 self.jobs.append(j)
                 # Reserve names of jobs loaded from queue.json so new adds
                 # cannot collide with them.
@@ -406,10 +455,21 @@ class QueueManager:
         job = Job(url, dd, conns=conns, headers=headers,
                   filename=filename, dest=dest)
         job._on_change = self._save
+        job._manager = self
         with self.lock:
             self.jobs.append(job)
         self._save()
         return job
+
+    def set_speed_limit(self, bytes_per_sec: int):
+        """Change the shared download speed limit live (0 = unlimited).
+
+        Applies immediately to the shared token bucket used by every job,
+        via token_bucket.set_limit().
+        """
+        self.speed_limit = max(0, int(bytes_per_sec or 0))
+        if self.token_bucket is not None:
+            self.token_bucket.set_limit(self.speed_limit)
 
     def start_all(self):
         for j in self.jobs:
