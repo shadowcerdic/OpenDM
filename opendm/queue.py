@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import warnings
 from pathlib import Path
 
 from . import engine
@@ -126,6 +127,13 @@ class Job:
         self._stop = threading.Event()
         self._thread = None
         self._on_change = None
+        # Completion callbacks (item 15): fn(job) is invoked exactly once
+        # after a successful completion (state == "completed"). Added via
+        # add_on_complete(); skipped on error, pause and cancel.
+        self.on_complete: list = []
+        # Backing store for the deprecated post_finish shim (gui.py still
+        # sets it; owned by the gui worker). See the property below.
+        self._post_finish = None
         # Intent flag: set by cancel(), read by the worker thread in _run so
         # the terminal "canceled" state is never overwritten by a stale
         # Paused/exception handler. Cleared on every fresh start().
@@ -236,6 +244,48 @@ class Job:
             except Exception:
                 pass
 
+    def add_on_complete(self, fn):
+        """Register fn(job) to run once after a successful completion.
+
+        Callbacks fire only when _run finishes with state == "completed";
+        they are skipped on error, pause and cancel. Each callback runs
+        inside its own try/except: a raising callback never breaks _run
+        and never prevents later callbacks from running.
+        """
+        self.on_complete.append(fn)
+
+    @property
+    def post_finish(self):
+        """Deprecated: replaced by add_on_complete() / on_complete.
+
+        The old post_finish attribute was never invoked by queue.py.
+        gui.py still sets it (owned by the gui worker; gui.py is out of
+        scope here), so this shim registers the assigned callable as a
+        completion callback -- keeping existing gui code working -- while
+        emitting a DeprecationWarning. New code must use
+        job.add_on_complete(fn).
+        """
+        return self._post_finish
+
+    @post_finish.setter
+    def post_finish(self, fn):
+        warnings.warn(
+            "Job.post_finish is deprecated; use Job.add_on_complete(fn) instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self._post_finish = fn
+        if fn is not None:
+            self.add_on_complete(lambda job: fn())
+
+    def _invoke_on_complete(self):
+        """Run completion callbacks; never propagates callback errors."""
+        for fn in list(self.on_complete):
+            try:
+                fn(self)
+            except Exception:
+                pass
+
     def _engine_download_kwargs(self) -> dict:
         """Resolve proxy/rate_limiter kwargs for engine.download.
 
@@ -290,6 +340,8 @@ class Job:
                 self.state = "completed"
             self._clear_secret_headers()
             self.finished = time.time()
+            if self.state == "completed":
+                self._invoke_on_complete()
             self._notify()
         except engine.Paused:
             if self._cancel_requested:

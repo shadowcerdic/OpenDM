@@ -9,6 +9,8 @@ Handles:
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -19,7 +21,7 @@ import urllib.parse
 import urllib.request
 from typing import Callable
 
-from . import __version__
+from . import __version__, engine
 
 GITHUB_API_LATEST = "https://api.github.com/repos/shadowcerdic/OpenDM/releases/latest"
 INSTALLER_ASSET_NAME = "OpenDM-Setup.exe"
@@ -60,7 +62,7 @@ def check_for_updates(proxy: str | None = None) -> dict | None:
         "Accept": "application/vnd.github+json",
         "User-Agent": f"OpenDM-Updater/{__version__}",
     }
-    handlers = []
+    handlers = [engine.SafeRedirectHandler()]
     if proxy:
         handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
     opener = urllib.request.build_opener(*handlers)
@@ -103,11 +105,17 @@ def check_for_updates(proxy: str | None = None) -> dict | None:
 
 
 def fetch_expected_sha256(sha256_url: str, target_filename: str, opener=None) -> str | None:
-    """Download SHA256SUMS.txt and extract 64-hex hash for target_filename."""
+    """Download SHA256SUMS.txt and extract 64-hex hash for target_filename.
+
+    When no caller-supplied opener is given, builds one with
+    engine.SafeRedirectHandler (never leaks Cookie/Authorization on
+    cross-origin redirects) instead of using raw urllib.request.urlopen.
+    """
     try:
         req = urllib.request.Request(sha256_url, headers={"User-Agent": f"OpenDM-Updater/{__version__}"})
-        call_open = opener.open if opener else urllib.request.urlopen
-        with call_open(req, timeout=15) as resp:
+        if opener is None:
+            opener = urllib.request.build_opener(engine.SafeRedirectHandler())
+        with opener.open(req, timeout=15) as resp:
             text = resp.read().decode("utf-8")
         return parse_sha256sums_text(text, target_filename)
     except Exception:
@@ -127,6 +135,38 @@ def parse_sha256sums_text(text: str, target_filename: str) -> str | None:
                 if len(h) == 64 and all(c in "0123456789abcdefABCDEF" for c in h):
                     return h.lower()
     return None
+
+
+def verify_installer(path: str | os.PathLike, expected_sha256: str | None) -> bool:
+    """Verify a downloaded installer against its expected SHA-256 hash.
+
+    Streams the file's SHA-256 and compares it to *expected_sha256* with
+    hmac.compare_digest (constant-time comparison).
+
+    Returns True on a match. Returns False -- never raises -- on a hash
+    mismatch, a missing/unreadable file, or when no expected hash is
+    available, so callers can delete the file and show an error instead
+    of crashing.
+
+    NOTE: a hash fetched over the same release channel as the installer
+    proves INTEGRITY (the file arrived intact), not AUTHENTICITY. It does
+    not defend against a compromised release channel; true authenticity
+    requires a cryptographic signature over the release.
+    """
+    try:
+        expected = expected_sha256.strip().lower()
+    except AttributeError:
+        return False
+    if not expected or not os.path.isfile(path):
+        return False
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return False
+    return hmac.compare_digest(digest.hexdigest(), expected)
 
 
 def get_update_target_path(tag_name: str) -> str:
