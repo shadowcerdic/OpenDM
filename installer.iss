@@ -3,7 +3,7 @@
 ; OpenDM source code, shortcuts, and Chrome Native Messaging Host registry keys.
 
 #define MyAppName "OpenDM"
-#define MyAppVersion "2.0.0"
+#define MyAppVersion "2.0.1"
 #define MyAppPublisher "OpenDM Project"
 #define MyAppURL "https://github.com/shadowcerdic/OpenDM"
 #define MyAppExeName "OpenDM.exe"
