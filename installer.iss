@@ -72,8 +72,8 @@ end;
 
 procedure RenderNativeHostManifest();
 var
-  ManifestPath, InstallDir: String;
-  Content: AnsiString;
+  ManifestPath: String;
+  Content, InstallDir: AnsiString;
 begin
   ManifestPath := ExpandConstant('{app}\app\opendm\org.opendm.native_host.json');
   if not LoadStringFromFile(ManifestPath, Content) then
