@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import http.server
+import os
 import threading
 import time
 
@@ -597,6 +598,120 @@ def test_abort_event_interrupts_retry_backoff(tmp_path):
                     abort_event=abort)
         dt = time.time() - t0
         assert dt < 5.0, f"backoff was not interrupted ({dt:.1f}s)"
+
+
+# ---------------------------------------------------------------------------
+# Item 6: checkpointing — sidecar persisted every ~2s from a single timer
+# (fsync before write), plus on pause/error/completion.
+# ---------------------------------------------------------------------------
+
+def test_checkpoint_timer_persists_sidecar(tmp_path):
+    """During a slow download the sidecar mtime must advance ~every 2s via timer."""
+    with make_server({"slow": 0.05}) as server:
+        dest = str(tmp_path / "ckpt.bin")
+        stop = threading.Event()
+        done = {}
+
+        def run():
+            try:
+                engine.download(server.url("/file.bin"), dest=dest, conns=1,
+                                stop_event=stop)
+            except engine.Paused:
+                done["paused"] = True
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        try:
+            # initial save_meta happens before workers start
+            for _ in range(100):
+                sc = engine.load_sidecar(dest)
+                if sc is not None:
+                    break
+                time.sleep(0.05)
+            assert sc is not None, "sidecar must exist once download starts"
+            m0 = os.path.getmtime(engine.get_sidecar_path(dest))
+            time.sleep(3.0)  # timer fires at ~2s
+            m1 = os.path.getmtime(engine.get_sidecar_path(dest))
+            assert m1 > m0, "timer did not rewrite the sidecar within ~2s"
+        finally:
+            stop.set()
+            t.join(timeout=15)
+        assert done.get("paused")
+
+
+def test_sidecar_cursors_cover_received_bytes_on_pause(tmp_path):
+    """After ~2s of slow download + pause, sidecar cursors reflect >= 90%
+    of received bytes (pause triggers a final fsync+checkpoint)."""
+    with make_server({"slow": 0.05}) as server:
+        dest = str(tmp_path / "pc.bin")
+        stop = threading.Event()
+        last = {"done": 0}
+
+        def status_cb(d, total, dt):
+            last["done"] = d
+
+        def run():
+            try:
+                engine.download(server.url("/file.bin"), dest=dest, conns=2,
+                                stop_event=stop, status_cb=status_cb)
+            except engine.Paused:
+                pass
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        time.sleep(2.5)
+        stop.set()
+        t.join(timeout=15)
+        sc = engine.load_sidecar(dest)
+        assert sc is not None, "sidecar must exist after pause"
+        have = sum(s["cursor"] - s["start"] for s in sc["segments"])
+        assert last["done"] > 0
+        assert have >= 0.9 * last["done"], \
+            f"sidecar covers {have} of {last['done']} received bytes"
+
+
+def test_kill9_resume_final_sha_matches(tmp_path):
+    """kill -9 a downloader subprocess mid-way; resume; sha256 must match."""
+    import subprocess
+    import sys
+    venv_python = "/home/hatch/workspace/opendm/.venv/bin/python"
+    with make_server({"slow": 0.15}) as server:
+        url = server.url("/file.bin")
+        dest = str(tmp_path / "kill.bin")
+        driver = tmp_path / "dl_driver.py"
+        driver.write_text(
+            "import sys\n"
+            "sys.path.insert(0, '/home/hatch/workspace/opendm')\n"
+            "from opendm import engine\n"
+            "engine.download(sys.argv[1], dest=sys.argv[2], conns=2)\n"
+        )
+        proc = subprocess.Popen([venv_python, str(driver), url, dest])
+        try:
+            # Wait until the timer has checkpointed real progress (~2s+).
+            ok = False
+            for _ in range(100):
+                if proc.poll() is not None:
+                    break
+                sc = engine.load_sidecar(dest)
+                if sc is not None:
+                    have = sum(s["cursor"] - s["start"] for s in sc["segments"])
+                    age = time.time() - os.path.getmtime(engine.get_sidecar_path(dest))
+                    if have > 1024 * 1024 and age < 3.0:
+                        ok = True
+                        break
+                time.sleep(0.1)
+            assert proc.poll() is None, "downloader finished before kill"
+            assert ok, "no checkpointed progress observed before kill"
+            proc.kill()  # SIGKILL: no cleanup, like kill -9
+            proc.wait(timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+        # Resume fast in-process; must complete with the source sha256.
+        server.cfg["slow"] = 0
+        res = engine.download(url, dest=dest, conns=2)
+        assert res["sha256"] == PAYLOAD_SHA256, "resumed download is corrupt"
 
 
 # ---------------------------------------------------------------------------

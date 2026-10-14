@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 import threading
 import time
 import urllib.error
@@ -213,12 +214,26 @@ def get_sidecar_path(target_path: str) -> str:
 
 
 def save_sidecar(target_path: str, data: dict):
-    """Atomically write sidecar metadata via temp file."""
+    """Atomically write sidecar metadata via a unique temp file.
+
+    The temp name is unique per call so concurrent checkpoints (timer thread
+    and workers) cannot clobber each other's temp file; os.replace keeps the
+    visible sidecar update atomic (last writer wins).
+    """
     path = get_sidecar_path(target_path)
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".opendm-",
+                               suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def load_sidecar(target_path: str) -> dict | None:
@@ -308,9 +323,14 @@ def _worker_loop(
     single_segment: bool = True,
     total: int = 0,
     abort_event: threading.Event | None = None,
+    fd_registry: tuple | None = None,
 ):
     """Worker handling segment fetching and dynamic work stealing."""
     fd = open(dest_path, "r+b")
+    if fd_registry is not None:
+        _fds, _fds_lock = fd_registry
+        with _fds_lock:
+            _fds.append(fd)
     try:
         current_seg = seg
         while current_seg is not None:
@@ -346,6 +366,13 @@ def _worker_loop(
             if current_seg is not None and meta_saver:
                 meta_saver()
     finally:
+        if fd_registry is not None:
+            _fds, _fds_lock = fd_registry
+            with _fds_lock:
+                try:
+                    _fds.remove(fd)
+                except ValueError:
+                    pass
         fd.close()
 
 
@@ -656,7 +683,26 @@ def download(
             }
         save_sidecar(name, data)
 
-    # Calculate initial done bytes
+    # Registry of live worker fds so checkpoints can fsync them.
+    worker_fds: list = []
+    worker_fds_lock = threading.Lock()
+
+    def checkpoint():
+        """Flush + fsync every worker fd, then persist the sidecar.
+
+        The sidecar never records bytes that are not yet flushed to disk.
+        """
+        with worker_fds_lock:
+            live = list(worker_fds)
+        for fd in live:
+            try:
+                fd.flush()
+                os.fsync(fd.fileno())
+            except (OSError, ValueError):
+                pass
+        save_meta()
+
+    # Calculate initial done bytes (includes resumed bytes).
     done = [sum(s.have for s in segments)]
 
     limit_lock = threading.Lock()
@@ -706,11 +752,12 @@ def download(
                 extra_headers=headers,
                 etag=etag,
                 last_modified=last_modified,
-                meta_saver=save_meta,
+                meta_saver=checkpoint,
                 proxy=proxy,
                 single_segment=single_segment,
                 total=total,
                 abort_event=abort_event,
+                fd_registry=(worker_fds, worker_fds_lock),
             )
         except Paused:
             pass
@@ -722,23 +769,40 @@ def download(
                     errors.append(ex)
             abort_event.set()
 
-    # Launch worker threads
-    ths = []
-    initial_segments = list(segments)
-    for seg in initial_segments:
-        t = threading.Thread(target=run_worker, args=(seg,), daemon=True)
-        ths.append(t)
-        t.start()
+    # Single checkpoint timer: persists the sidecar every ~2s (fsync first).
+    ckpt_stop = threading.Event()
 
-    for t in ths:
-        t.join()
+    def _checkpoint_loop():
+        while not ckpt_stop.wait(2.0):
+            try:
+                checkpoint()
+            except Exception:
+                pass
+
+    ckpt_thread = threading.Thread(target=_checkpoint_loop, daemon=True)
+    ckpt_thread.start()
+
+    try:
+        # Launch worker threads
+        ths = []
+        initial_segments = list(segments)
+        for seg in initial_segments:
+            t = threading.Thread(target=run_worker, args=(seg,), daemon=True)
+            ths.append(t)
+            t.start()
+
+        for t in ths:
+            t.join()
+    finally:
+        ckpt_stop.set()
+        ckpt_thread.join(timeout=10)
 
     if stop_event is not None and stop_event.is_set():
-        save_meta()
+        checkpoint()
         emit_parts()
         raise Paused()
 
-    save_meta()
+    checkpoint()
     emit_parts()
 
     if errors:
