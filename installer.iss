@@ -80,7 +80,7 @@ begin
   if not LoadStringFromFile(ManifestPath, Content) then
     RaiseException('OpenDM: could not read native host manifest template: ' + ManifestPath);
   InstallDir := EscapeJsonBackslashes(ExpandConstant('{app}'));
-  { Fill every {app} placeholder with the JSON-escaped install dir. }
+  // Fill every '{app}' placeholder with the JSON-escaped install dir.
   P := Pos('{app}', Content);
   while P > 0 do
   begin
