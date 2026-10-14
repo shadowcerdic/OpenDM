@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -753,6 +754,43 @@ def _fetch_chunk(url: str, start: int, end: int, part_path: str,
     return seg.have
 
 
+def write_zone_identifier(final_path: str, url: str,
+                            referer: str | None = None):
+    """Write the Windows Mark-of-the-Web Zone.Identifier ADS.
+
+    Creates the NTFS alternate data stream ``<final_path>:Zone.Identifier``
+    with ``[ZoneTransfer]`` / ``ZoneId=3`` (internet zone), a ``ReferrerUrl``
+    line when a referer is known, and a ``HostUrl`` line carrying the download
+    URL with any userinfo stripped -- mirroring what browsers write for
+    internet downloads.
+
+    Best effort: any OSError (non-NTFS filesystem, permissions, ...) is
+    swallowed. No-op on non-Windows platforms.
+
+    NOTE -- UNVERIFIED ON REAL WINDOWS: implemented and unit-tested against
+    mocks only; needs a real Windows/NTFS run to confirm ADS behavior.
+    """
+    if sys.platform != "win32":
+        return
+    parsed = urllib.parse.urlsplit(url)
+    # Strip userinfo (https://user:pass@host/ -> https://host/), keeping
+    # host case, port, path, query and fragment intact.
+    netloc = parsed.netloc.rsplit("@", 1)[-1]
+    host_url = urllib.parse.urlunsplit(
+        (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    lines = ["[ZoneTransfer]", "ZoneId=3"]
+    if referer:
+        lines.append(f"ReferrerUrl={referer}")
+    lines.append(f"HostUrl={host_url}")
+    content = "\n".join(lines) + "\n"
+    try:
+        with open(f"{final_path}:Zone.Identifier", "w",
+                  encoding="utf-8") as f:
+            f.write(content)
+    except OSError:
+        pass
+
+
 def download(
     url: str,
     dest: str | None = None,
@@ -992,6 +1030,16 @@ def download(
     # Completion gate passed: atomically publish the .part as the final name.
     # The final name never exists before this point.
     os.replace(part, name)
+
+    # Mark-of-the-Web (Windows only): Zone.Identifier ADS for the download.
+    if sys.platform == "win32":
+        referer = None
+        if headers:
+            for k, v in headers.items():
+                if k.lower() == "referer":
+                    referer = v
+                    break
+        write_zone_identifier(name, url, referer=referer)
 
     # Clean up sidecar file on verified completion
     sidecar_path = get_sidecar_path(name)
