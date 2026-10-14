@@ -93,9 +93,12 @@ def test_to_dict_keeps_headers_for_active_states(tmp_path, state):
 # --- config_dir(app=...) helper --------------------------------------------
 
 def test_config_dir_default_and_app_param(monkeypatch, tmp_path):
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    assert security.config_dir() == tmp_path / "opendm"
-    assert security.config_dir(app="dl") == tmp_path / "dl"
+    # POSIX branch: pin the platform so XDG_CONFIG_HOME is honored even on
+    # real Windows (where config_dir() takes the %APPDATA% branch instead).
+    with mock.patch.object(sys, "platform", "linux"):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        assert security.config_dir() == tmp_path / "opendm"
+        assert security.config_dir(app="dl") == tmp_path / "dl"
 
 
 def test_config_dir_windows_returns_appdata_opendm(monkeypatch, tmp_path):
@@ -107,9 +110,10 @@ def test_config_dir_windows_returns_appdata_opendm(monkeypatch, tmp_path):
 
 
 def test_queue_state_file_uses_config_dir_helper(monkeypatch, tmp_path):
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    qm = QueueManager(str(tmp_path / "downloads"), state_file=None)
-    assert qm.state_file == tmp_path / "opendm" / "queue.json"
+    with mock.patch.object(sys, "platform", "linux"):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        qm = QueueManager(str(tmp_path / "downloads"), state_file=None)
+        assert qm.state_file == tmp_path / "opendm" / "queue.json"
 
 
 def test_windows_migrates_legacy_queue_json(monkeypatch, tmp_path):
@@ -129,6 +133,8 @@ def test_windows_migrates_legacy_queue_json(monkeypatch, tmp_path):
 
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setenv("HOME", str(home))
+    # Windows' expanduser() reads USERPROFILE, not HOME.
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("APPDATA", str(appdata))
     with mock.patch.object(sys, "platform", "win32"):
         qm = QueueManager(str(tmp_path / "downloads"), state_file=None)
