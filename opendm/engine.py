@@ -269,6 +269,19 @@ def preallocate_file(filepath: str, size: int):
             f.truncate(size)
 
 
+def _if_range_value(etag: str | None, last_modified: str | None) -> str | None:
+    """Pick the If-Range validator: strong ETag preferred, else Last-Modified.
+
+    A weak ETag (starting with ``W/``) is not a valid If-Range validator, so
+    Last-Modified is used instead. Returns None when neither is available.
+    """
+    if etag and not etag.startswith("W/"):
+        return etag
+    if last_modified:
+        return last_modified
+    return None
+
+
 def _worker_loop(
     url: str,
     seg: Segment,
@@ -282,6 +295,7 @@ def _worker_loop(
     meta_saver: Callable[[], None] | None,
     proxy: str | None = None,
     max_retries: int = 5,
+    last_modified: str | None = None,
 ):
     """Worker handling segment fetching and dynamic work stealing."""
     fd = open(dest_path, "r+b")
@@ -300,6 +314,7 @@ def _worker_loop(
                 on_bytes=on_bytes,
                 extra_headers=extra_headers,
                 etag=etag,
+                last_modified=last_modified,
                 meta_saver=meta_saver,
                 proxy=proxy,
                 max_retries=max_retries,
@@ -327,12 +342,17 @@ def _download_single_segment(
     meta_saver: Callable[[], None] | None,
     proxy: str | None = None,
     max_retries: int = 5,
+    last_modified: str | None = None,
 ):
     """Fetch assigned segment range directly writing to preallocated fd."""
     handlers = []
     if proxy:
         handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
     opener = urllib.request.build_opener(*handlers)
+
+    # If-Range validator: strong ETag only; weak ETag falls back to
+    # Last-Modified; omitted when neither is available.
+    if_range = _if_range_value(etag, last_modified)
 
     attempt = 0
     while True:
@@ -351,12 +371,27 @@ def _download_single_segment(
             for k, v in extra_headers.items():
                 if k.lower() in ("cookie", "referer", "user-agent", "authorization"):
                     hdrs[k] = v
-        if etag:
-            hdrs["If-Range"] = etag
+        if if_range:
+            hdrs["If-Range"] = if_range
 
         try:
             req = urllib.request.Request(url, headers=hdrs)
             with opener.open(req, timeout=30) as r:
+                # A 200 on a mid-file range request means the server ignored
+                # Range. If we sent If-Range, the file changed remotely;
+                # without a validator it is a plain protocol violation.
+                if pos > 0 and r.status == 200:
+                    if if_range:
+                        raise RemoteFileChanged(
+                            "Server returned 200 OK on range request "
+                            f"bytes={pos}-{current_end} with If-Range; "
+                            "remote file changed."
+                        )
+                    raise ProtocolViolation(
+                        f"Server responded with 200 instead of 206 Partial Content "
+                        f"for mid-segment request bytes={pos}-{current_end} "
+                        "(no If-Range validator was sent)"
+                    )
                 # Protocol Safety: Guard against server ignoring Range on mid-file request
                 if pos > 0 and r.status != 206:
                     raise ProtocolViolation(
@@ -499,7 +534,8 @@ def _fetch_chunk(url: str, start: int, end: int, part_path: str,
         _download_single_segment(
             url=url, seg=seg, fd=fd, seg_lock=lock,
             stop_event=stop_event, on_bytes=on_bytes,
-            extra_headers=extra_headers, etag=None, meta_saver=None,
+            extra_headers=extra_headers, etag=None, last_modified=None,
+            meta_saver=None,
             max_retries=max_retries
         )
     return seg.have
@@ -547,10 +583,16 @@ def download(
     # Resume verification & segment loading
     segments: list[Segment] = []
     if sidecar and sidecar.get("url") == url and sidecar.get("total") == total:
-        # Check If-Range if etag present
+        # Resume validation: strong ETag first, falling back to Last-Modified
+        # when the ETag is absent on either side.
         saved_etag = sidecar.get("etag")
-        if etag and saved_etag and etag != saved_etag:
-            raise RemoteFileChanged(f"ETag mismatch on resume: {etag} != {saved_etag}")
+        saved_lm = sidecar.get("last_modified")
+        if etag and saved_etag:
+            if etag != saved_etag:
+                raise RemoteFileChanged(f"ETag mismatch on resume: {etag} != {saved_etag}")
+        elif last_modified and saved_lm and last_modified != saved_lm:
+            raise RemoteFileChanged(
+                f"Last-Modified mismatch on resume: {last_modified} != {saved_lm}")
         for s_dict in sidecar.get("segments", []):
             segments.append(Segment.from_dict(s_dict))
     else:
@@ -615,6 +657,7 @@ def download(
                 on_bytes=throttled_on_bytes,
                 extra_headers=headers,
                 etag=etag,
+                last_modified=last_modified,
                 meta_saver=save_meta,
                 proxy=proxy,
             )

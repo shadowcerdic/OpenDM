@@ -237,3 +237,148 @@ def test_enospc_write_error_is_fatal_and_not_retried(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Item 3: If-Range — strong ETag only; else Last-Modified; else omit.
+# 200 on mid-file range -> RemoteFileChanged iff If-Range sent else ProtocolViolation.
+# Resume falls back to Last-Modified when ETag is absent.
+# ---------------------------------------------------------------------------
+
+def _get_header(server, path, name):
+    for r in server.requests:
+        if r["method"] == "GET" and r["path"] == path:
+            return r["headers"].get(name)
+    return None
+
+
+def test_if_range_sent_for_strong_etag(tmp_path):
+    """Strong ETag -> If-Range carries the ETag."""
+    with make_server({}) as server:
+        dest = str(tmp_path / "s.bin")
+        engine.preallocate_file(dest, 4096)
+        seg = engine.Segment(0, 0, 4095)
+        lock = threading.Lock()
+        with open(dest, "r+b") as fd:
+            engine._download_single_segment(
+                url=server.url("/file.bin"), seg=seg, fd=fd, seg_lock=lock,
+                stop_event=None, on_bytes=None, extra_headers=None,
+                etag='"0d4d-etag-1"', meta_saver=None, max_retries=2)
+        assert _get_header(server, "/file.bin", "if-range") == '"0d4d-etag-1"'
+
+
+def test_if_range_uses_last_modified_for_weak_etag(tmp_path):
+    """Weak ETag (W/...) -> If-Range carries Last-Modified, not the weak ETag."""
+    with make_server({"weak_etag": True}) as server:
+        dest = str(tmp_path / "w.bin")
+        engine.preallocate_file(dest, 4096)
+        seg = engine.Segment(0, 0, 4095)
+        lock = threading.Lock()
+        with open(dest, "r+b") as fd:
+            engine._download_single_segment(
+                url=server.url("/file.bin"), seg=seg, fd=fd, seg_lock=lock,
+                stop_event=None, on_bytes=None, extra_headers=None,
+                etag='W/"0d4d-etag-1"',
+                last_modified="Wed, 01 Jan 2025 00:00:00 GMT",
+                meta_saver=None, max_retries=2)
+        assert _get_header(server, "/file.bin", "if-range") == \
+            "Wed, 01 Jan 2025 00:00:00 GMT"
+
+
+def test_if_range_omitted_without_validators(tmp_path):
+    """No ETag and no Last-Modified -> no If-Range header at all."""
+    with make_server({}) as server:
+        dest = str(tmp_path / "n.bin")
+        engine.preallocate_file(dest, 4096)
+        seg = engine.Segment(0, 0, 4095)
+        lock = threading.Lock()
+        with open(dest, "r+b") as fd:
+            engine._download_single_segment(
+                url=server.url("/file.bin"), seg=seg, fd=fd, seg_lock=lock,
+                stop_event=None, on_bytes=None, extra_headers=None,
+                etag=None, last_modified=None, meta_saver=None, max_retries=2)
+        assert _get_header(server, "/file.bin", "if-range") is None
+
+
+def test_200_mid_file_with_if_range_raises_remote_file_changed(tmp_path):
+    """200 on a mid-file range request with If-Range sent -> RemoteFileChanged."""
+    with make_server({"ignore_range": True}) as server:
+        dest = str(tmp_path / "c.bin")
+        engine.preallocate_file(dest, 4096)
+        seg = engine.Segment(0, 100, 4095, cursor=100)  # pos > 0
+        lock = threading.Lock()
+        with open(dest, "r+b") as fd:
+            with pytest.raises(engine.RemoteFileChanged):
+                engine._download_single_segment(
+                    url=server.url("/file.bin"), seg=seg, fd=fd, seg_lock=lock,
+                    stop_event=None, on_bytes=None, extra_headers=None,
+                    etag='"0d4d-etag-1"', meta_saver=None, max_retries=1)
+
+
+def test_200_mid_file_without_if_range_raises_protocol_violation(tmp_path):
+    """200 on a mid-file range request with no If-Range -> ProtocolViolation."""
+    with make_server({"ignore_range": True}) as server:
+        dest = str(tmp_path / "p.bin")
+        engine.preallocate_file(dest, 4096)
+        seg = engine.Segment(0, 100, 4095, cursor=100)  # pos > 0
+        lock = threading.Lock()
+        with open(dest, "r+b") as fd:
+            with pytest.raises(engine.ProtocolViolation):
+                engine._download_single_segment(
+                    url=server.url("/file.bin"), seg=seg, fd=fd, seg_lock=lock,
+                    stop_event=None, on_bytes=None, extra_headers=None,
+                    etag=None, last_modified=None, meta_saver=None,
+                    max_retries=1)
+
+
+def test_resume_falls_back_to_last_modified(tmp_path, monkeypatch):
+    """Resume with no ETag anywhere: Last-Modified mismatch -> RemoteFileChanged."""
+    with make_server({}) as server:
+        url = server.url("/file.bin")
+        dest = str(tmp_path / "lm.bin")
+        engine.preallocate_file(dest, len(PAYLOAD))
+        seg = engine.Segment(0, 0, len(PAYLOAD) - 1, cursor=1024)
+        engine.save_sidecar(dest, {
+            "url": url, "total": len(PAYLOAD), "etag": None,
+            "last_modified": "Wed, 01 Jan 2025 00:00:00 GMT",
+            "segments": [seg.to_dict()],
+        })
+        real_probe = engine.probe
+
+        def fake_probe(u, extra_headers=None, proxy=None):
+            m = real_probe(u, extra_headers=extra_headers, proxy=proxy)
+            m["etag"] = None
+            m["last_modified"] = "Thu, 02 Jan 2025 00:00:00 GMT"  # changed!
+            return m
+
+        monkeypatch.setattr(engine, "probe", fake_probe)
+        with pytest.raises(engine.RemoteFileChanged, match="Last-Modified"):
+            engine.download(url, dest=dest, conns=1)
+
+
+def test_resume_last_modified_match_continues(tmp_path, monkeypatch):
+    """Resume with no ETag and matching Last-Modified proceeds normally."""
+    import hashlib
+    with make_server({}) as server:
+        url = server.url("/file.bin")
+        dest = str(tmp_path / "lm2.bin")
+        engine.preallocate_file(dest, len(PAYLOAD))
+        seg = engine.Segment(0, 0, len(PAYLOAD) - 1, cursor=0)
+        engine.save_sidecar(dest, {
+            "url": url, "total": len(PAYLOAD), "etag": None,
+            "last_modified": "Wed, 01 Jan 2025 00:00:00 GMT",
+            "segments": [seg.to_dict()],
+        })
+        real_probe = engine.probe
+
+        def fake_probe(u, extra_headers=None, proxy=None):
+            m = real_probe(u, extra_headers=extra_headers, proxy=proxy)
+            m["etag"] = None  # no ETag: resume must use Last-Modified
+            return m
+
+        monkeypatch.setattr(engine, "probe", fake_probe)
+        res = engine.download(url, dest=dest, conns=1)
+        assert res["sha256"] == PAYLOAD_SHA256
+        # Worker must have sent If-Range with the Last-Modified value.
+        assert _get_header(server, "/file.bin", "if-range") == \
+            "Wed, 01 Jan 2025 00:00:00 GMT"
+
+
+# ---------------------------------------------------------------------------
