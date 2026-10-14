@@ -31,9 +31,8 @@ from PySide6.QtWidgets import (
     QLineEdit, QComboBox, QSpinBox, QDialog, QToolBar, QStatusBar,
     QHeaderView, QStyledItemDelegate, QStyleOptionViewItem, QMessageBox,
     QFileDialog, QDialogButtonBox, QPlainTextEdit, QFrame, QSplitter,
-    QSystemTrayIcon
+    QSystemTrayIcon, QSlider, QCheckBox, QFormLayout
 )
-from http.server import HTTPServer
 
 from .queue import QueueManager, STATES
 from .sanitize import sanitize_filename
@@ -400,6 +399,37 @@ class PromptBridge(QObject):
 
 
 # -----------------------------------------------------------------------------
+# Update-flow helpers (spec item 15)
+#
+# The SHA-256 shown before the update download is only the *expected* value
+# published with the release. It must never be presented as "Verified" --
+# verification happens after the download completes, in
+# MainWindow._finish_update_download via updater.verify_installer.
+# -----------------------------------------------------------------------------
+def update_sha_offer_line(expected_sha256: str | None) -> str:
+    """Text for the update-offer dialog shown BEFORE any download.
+
+    Deliberately says "Expected", never "Verified": nothing has been
+    downloaded or compared yet at this point.
+    """
+    if expected_sha256:
+        return f"Expected SHA-256: {expected_sha256[:16]}…"
+    return "No SHA-256 checksum published for this release — automatic install is unavailable."
+
+
+def update_no_hash_notice_line(html_url: str | None) -> str:
+    """Notice shown instead of the auto-install button when the release
+    publishes no SHA-256 checksum. Points the user at the release page
+    for a manual review/download."""
+    url = html_url or "(no release URL provided)"
+    return (
+        "No SHA-256 checksum was published for this release, so automatic "
+        "install is disabled. Review the release and download manually:\n"
+        f"{url}"
+    )
+
+
+# -----------------------------------------------------------------------------
 # Main Application Window (Fluent / Clean Modern Layout)
 # -----------------------------------------------------------------------------
 class MainWindow(QMainWindow):
@@ -439,11 +469,14 @@ class MainWindow(QMainWindow):
         try:
             from . import daemon as daemon_mod
             daemon_mod.QM = self.qm
-            httpd = HTTPServer(("127.0.0.1", daemon_mod.HTTP_PORT), daemon_mod.HardenedApiHandler)
+            httpd = daemon_mod.ThreadedHTTPServer(
+                ("127.0.0.1", daemon_mod.HTTP_PORT),
+                daemon_mod.HardenedApiHandler,
+            )
             self._daemon_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
             self._daemon_thread.start()
-        except Exception:
-            pass
+        except Exception as ex:
+            print(f"[OpenDM] embedded daemon failed to start: {ex}", file=sys.stderr)
 
     def _setup_system_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -765,9 +798,9 @@ class MainWindow(QMainWindow):
         else:
             self.speed_slider_lbl.setText(f"{val} MB/s")
             limit_bytes = val * 1024 * 1024
-        for job in self.qm.jobs:
-            if hasattr(job, "speed_limit"):
-                job.speed_limit = limit_bytes
+        # Wire straight into the QueueManager's shared token bucket so the
+        # limit applies live to every job (0 = unlimited).
+        self.qm.set_speed_limit(limit_bytes)
 
     def open_settings(self):
         """Proxy configuration dialog (HTTP / SOCKS5)."""
@@ -836,6 +869,23 @@ class MainWindow(QMainWindow):
             return
 
         # Display Update Dialog
+        dlg = self._build_update_offer_dialog(info)
+        dlg.exec()
+
+    def _build_update_offer_dialog(self, info: dict) -> QDialog:
+        """Build the update-offer dialog WITHOUT showing it (kept separate
+        from _handle_update_result so tests can inspect it headless).
+
+        When the release publishes no SHA-256 checksum, no auto-install is
+        offered: the release URL is shown instead so the user can review
+        and download the installer manually.
+        """
+        from . import __version__
+        tag = info.get("tag_name", "")
+        expected_sha = info.get("expected_sha256")
+        installer_url = info.get("installer_url")
+        html_url = info.get("html_url", "")
+
         dlg = QDialog(self)
         dlg.setWindowTitle("Software Update Available — OpenDM")
         dlg.setMinimumWidth(560)
@@ -847,8 +897,9 @@ class MainWindow(QMainWindow):
         v_lbl = QLabel(f"<b>A new version is available!</b> &nbsp; Current: <code>v{__version__}</code> &nbsp;➔&nbsp; <span style='color:#38bdf8; font-weight:bold;'>{tag}</span>")
         v_lbl.setStyleSheet("font-size: 13px; color: #f8fafc;")
         b_lay.addWidget(v_lbl)
-        if info.get("expected_sha256"):
-            sha_lbl = QLabel(f"<span style='color: #22c55e;'>✓ Verified SHA-256 Digest:</span> <code>{info['expected_sha256'][:16]}…</code>")
+        if expected_sha:
+            # Pre-download: the checksum is only *expected*, never "verified".
+            sha_lbl = QLabel(f"<span style='color: #38bdf8;'>{update_sha_offer_line(expected_sha)}</span>")
             sha_lbl.setStyleSheet("font-size: 11px; color: #94a3b8;")
             b_lay.addWidget(sha_lbl)
         lay.addWidget(badge_box)
@@ -861,28 +912,35 @@ class MainWindow(QMainWindow):
         notes_box.setFixedHeight(180)
         lay.addWidget(notes_box)
 
+        if not expected_sha:
+            notice = QLabel(update_no_hash_notice_line(html_url))
+            notice.setWordWrap(True)
+            notice.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            notice.setStyleSheet("font-size: 11px; color: #94a3b8;")
+            lay.addWidget(notice)
+
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         later_btn = QPushButton("Later")
         later_btn.clicked.connect(dlg.reject)
         btn_row.addWidget(later_btn)
 
-        install_btn = QPushButton("Download & Update Now")
-        install_btn.setStyleSheet("background: #2563eb; color: white; font-weight: bold; padding: 8px 18px; border-radius: 6px;")
-        btn_row.addWidget(install_btn)
+        if expected_sha:
+            install_btn = QPushButton("Download & Update Now")
+            install_btn.setObjectName("install_btn")
+            install_btn.setStyleSheet("background: #2563eb; color: white; font-weight: bold; padding: 8px 18px; border-radius: 6px;")
+            btn_row.addWidget(install_btn)
+
+            def _do_update():
+                dlg.accept()
+                if not installer_url:
+                    QMessageBox.warning(self, "No Installer Asset", "OpenDM-Setup.exe asset was not found in release.")
+                    return
+                self._start_update_download(installer_url, tag, expected_sha)
+
+            install_btn.clicked.connect(_do_update)
         lay.addLayout(btn_row)
-
-        installer_url = info.get("installer_url")
-
-        def _do_update():
-            dlg.accept()
-            if not installer_url:
-                QMessageBox.warning(self, "No Installer Asset", "OpenDM-Setup.exe asset was not found in release.")
-                return
-            self._start_update_download(installer_url, tag, info.get("expected_sha256"))
-
-        install_btn.clicked.connect(_do_update)
-        dlg.exec()
+        return dlg
 
     def _start_update_download(self, url: str, tag: str, expected_sha: str | None):
         from . import updater
@@ -900,27 +958,16 @@ class MainWindow(QMainWindow):
         if expected_sha:
             job.expected_sha256 = expected_sha
 
-        # Completion handler: trigger detached installer and clean app exit
-        def on_update_complete():
-            def _ask_install():
-                ret = QMessageBox.question(
-                    self, "Update Downloaded",
-                    f"OpenDM {tag} has been downloaded and verified successfully.\n\nInstall update now?",
-                    QMessageBox.Yes | QMessageBox.No
-                )
-                if ret == QMessageBox.Yes:
-                    self._launch_installer_and_quit(target_path)
+        def _on_job_complete(_job):
+            # Runs on the download worker thread: never touch Qt widgets
+            # here. Marshal the verification/install prompts onto the Qt
+            # GUI thread.
+            QTimer.singleShot(
+                0,
+                lambda: self._finish_update_download(job, target_path, tag, expected_sha),
+            )
 
-            QTimer.singleShot(0, _ask_install)
-
-        # Monitor job completion
-        orig_post_finish = getattr(job, "post_finish", None)
-        def hooked_finish():
-            if orig_post_finish:
-                orig_post_finish()
-            if job.state == "completed":
-                on_update_complete()
-        job.post_finish = hooked_finish
+        job.add_on_complete(_on_job_complete)
 
         job.start()
         self.refresh_rows()
@@ -928,6 +975,32 @@ class MainWindow(QMainWindow):
             self, "Update Started",
             f"Downloading {filename} via OpenDM accelerated engine.\nYou will be prompted to install once verified."
         )
+
+    def _finish_update_download(self, job, target_path: str, tag: str, expected_sha: str | None):
+        """GUI-thread handler for a finished update download.
+
+        Verifies the installer SHA-256 before offering to install it.
+        Must only ever run on the Qt GUI thread (it is marshaled there by
+        _start_update_download via QTimer.singleShot).
+        """
+        from . import updater
+        if updater.verify_installer(target_path, expected_sha):
+            ret = QMessageBox.question(
+                self, "Update Downloaded",
+                f"OpenDM {tag} has been downloaded and verified successfully.\n\nInstall update now?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if ret == QMessageBox.Yes:
+                self._launch_installer_and_quit(target_path)
+        else:
+            try:
+                os.remove(target_path)
+            except OSError:
+                pass
+            QMessageBox.critical(
+                self, "Update Verification Failed",
+                "The downloaded update failed SHA-256 verification and has been deleted.\n\nThe installer will NOT be launched."
+            )
 
     def _launch_installer_and_quit(self, installer_path: str):
         from . import updater
