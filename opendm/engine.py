@@ -9,6 +9,7 @@ Features:
 """
 from __future__ import annotations
 
+import collections
 import email.utils
 import errno
 import hashlib
@@ -27,6 +28,8 @@ from typing import Callable
 from .sanitize import parse_content_disposition, sanitize_filename
 
 UA = "OpenDM/2.0"
+
+MAX_CONNS = 16  # hard cap on parallel connections/workers
 PART_DIR = ".opendm"
 MIN_SPLIT_SIZE = 2 * 1024 * 1024  # 2 MB minimum remaining for work stealing
 PAGE_SIZE = 4096
@@ -248,15 +251,19 @@ def load_sidecar(target_path: str) -> dict | None:
         return None
 
 
-def steal_work(segments: list[Segment], lock: threading.Lock) -> Segment | None:
+def steal_work(segments: list[Segment], lock: threading.Lock,
+               exclude_ids: set[int] | None = None) -> Segment | None:
     """Find active segment with largest remaining bytes and steal its second half.
 
     Splits range aligned to PAGE_SIZE. Returns newly assigned Segment or None.
+    Segments whose id() is in exclude_ids (e.g. waiting in the pending queue)
+    are never stolen from.
     """
     with lock:
         active_candidates = [
             s for s in segments
             if (s.end - s.cursor + 1) >= MIN_SPLIT_SIZE
+            and (exclude_ids is None or id(s) not in exclude_ids)
         ]
         if not active_candidates:
             return None
@@ -324,6 +331,7 @@ def _worker_loop(
     total: int = 0,
     abort_event: threading.Event | None = None,
     fd_registry: tuple | None = None,
+    pending: collections.deque | None = None,
 ):
     """Worker handling segment fetching and dynamic work stealing."""
     fd = open(dest_path, "r+b")
@@ -357,12 +365,22 @@ def _worker_loop(
                 abort_event=abort_event,
             )
 
-            # Segment finished. Attempt work stealing!
+            # Segment finished. Pick up a pending segment first, if any;
+            # only then attempt work stealing.
             if stop_event is not None and stop_event.is_set():
                 raise Paused()
             if abort_event is not None and abort_event.is_set():
                 raise _Aborted()
-            current_seg = steal_work(segments, seg_lock)
+            current_seg = None
+            exclude_ids = None
+            if pending is not None:
+                with seg_lock:
+                    if pending:
+                        current_seg = pending.popleft()
+                    exclude_ids = {id(s) for s in pending}
+            if current_seg is None:
+                current_seg = steal_work(segments, seg_lock,
+                                         exclude_ids=exclude_ids)
             if current_seg is not None and meta_saver:
                 meta_saver()
     finally:
@@ -622,6 +640,7 @@ def download(
     proxy: str | None = None,
 ) -> dict:
     """v2.0 Pre-allocated, lock-free parallel download with Work Stealing."""
+    conns = max(1, min(int(conns), MAX_CONNS))
     t0 = time.time()
     meta = probe(url, extra_headers=headers, proxy=proxy)
     total = meta["size"]
@@ -758,6 +777,7 @@ def download(
                 total=total,
                 abort_event=abort_event,
                 fd_registry=(worker_fds, worker_fds_lock),
+                pending=pending,
             )
         except Paused:
             pass
@@ -782,10 +802,17 @@ def download(
     ckpt_thread = threading.Thread(target=_checkpoint_loop, daemon=True)
     ckpt_thread.start()
 
+    # At most `conns` workers; remaining incomplete segments wait in a pending
+    # queue that workers pick up before they try work stealing.
+    pending: collections.deque[Segment] = collections.deque()
+    incomplete = [s for s in segments if s.cursor <= s.end]
+    initial_segments = incomplete[:conns]
+    for s in incomplete[conns:]:
+        pending.append(s)
+
     try:
         # Launch worker threads
         ths = []
-        initial_segments = list(segments)
         for seg in initial_segments:
             t = threading.Thread(target=run_worker, args=(seg,), daemon=True)
             ths.append(t)

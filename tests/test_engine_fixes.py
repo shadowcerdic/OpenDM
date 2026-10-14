@@ -715,3 +715,77 @@ def test_kill9_resume_final_sha_matches(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Item 7: connection cap — MAX_CONNS=16, conns clamped to 1..16; on resume at
+# most `conns` workers start, the rest wait in a pending queue.
+# ---------------------------------------------------------------------------
+
+def test_max_conns_constant():
+    assert engine.MAX_CONNS == 16
+
+
+def _counting_worker_loop(monkeypatch):
+    """Wrap engine._worker_loop to record max concurrent worker entries."""
+    import threading as _th
+    state = {"cur": 0, "max": 0}
+    lock = _th.Lock()
+    real = engine._worker_loop
+
+    def counting(*a, **k):
+        with lock:
+            state["cur"] += 1
+            state["max"] = max(state["max"], state["cur"])
+        try:
+            return real(*a, **k)
+        finally:
+            with lock:
+                state["cur"] -= 1
+
+    monkeypatch.setattr(engine, "_worker_loop", counting)
+    return state
+
+
+def test_conns_clamped_to_max_conns(tmp_path, monkeypatch):
+    """conns=100 must not start more than MAX_CONNS workers."""
+    state = _counting_worker_loop(monkeypatch)
+    with make_server({"slow": 0.05}) as server:
+        res = engine.download(server.url("/file.bin"),
+                              dest=str(tmp_path / "cc.bin"), conns=100)
+    assert res["sha256"] == PAYLOAD_SHA256
+    assert res["connections"] == 16, \
+        f"plan should be clamped to 16 segments, got {res['connections']}"
+    assert state["max"] <= 16, f"{state['max']} concurrent workers > MAX_CONNS"
+
+
+def test_conns_clamped_to_min_one(tmp_path):
+    """conns=0 must behave as a single connection."""
+    with make_server({}) as server:
+        res = engine.download(server.url("/file.bin"),
+                              dest=str(tmp_path / "c1.bin"), conns=0)
+    assert res["sha256"] == PAYLOAD_SHA256
+    assert res["connections"] == 1
+
+
+def test_resume_pending_queue_limits_workers(tmp_path, monkeypatch):
+    """20 incomplete segments + conns=4: at most 4 workers run at once."""
+    state = _counting_worker_loop(monkeypatch)
+    with make_server({"slow": 0.02}) as server:
+        url = server.url("/file.bin")
+        dest = str(tmp_path / "pq.bin")
+        engine.preallocate_file(dest, len(PAYLOAD))
+        ranges = engine.plan_ranges(len(PAYLOAD), 20)
+        segs = [engine.Segment(i, s, e, cursor=s) for i, (s, e) in enumerate(ranges)]
+        assert len(segs) == 20
+        engine.save_sidecar(dest, {
+            "url": url, "total": len(PAYLOAD), "etag": '"0d4d-etag-1"',
+            "last_modified": "Wed, 01 Jan 2025 00:00:00 GMT",
+            "segments": [s.to_dict() for s in segs],
+        })
+        res = engine.download(url, dest=dest, conns=4)
+    assert res["sha256"] == PAYLOAD_SHA256
+    assert state["max"] <= 4, \
+        f"{state['max']} concurrent workers, expected at most 4"
+    assert state["max"] >= 2, \
+        f"only {state['max']} worker(s) ran; pending queue may be starved"
+
+
+# ---------------------------------------------------------------------------
