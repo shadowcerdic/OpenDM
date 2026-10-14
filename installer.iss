@@ -74,12 +74,20 @@ procedure RenderNativeHostManifest();
 var
   ManifestPath: String;
   Content, InstallDir: AnsiString;
+  P: Integer;
 begin
   ManifestPath := ExpandConstant('{app}\app\opendm\org.opendm.native_host.json');
   if not LoadStringFromFile(ManifestPath, Content) then
     RaiseException('OpenDM: could not read native host manifest template: ' + ManifestPath);
   InstallDir := EscapeJsonBackslashes(ExpandConstant('{app}'));
-  StringChangeEx(Content, '{app}', InstallDir, True);
+  { Fill every {app} placeholder with the JSON-escaped install dir. }
+  P := Pos('{app}', Content);
+  while P > 0 do
+  begin
+    Delete(Content, P, 5);
+    Insert(InstallDir, Content, P);
+    P := Pos('{app}', Content);
+  end;
   if not SaveStringToFile(ManifestPath, Content, False) then
     RaiseException('OpenDM: could not write native host manifest: ' + ManifestPath);
 end;
