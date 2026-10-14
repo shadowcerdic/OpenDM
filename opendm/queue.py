@@ -4,6 +4,8 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import shutil
+import sys
 import threading
 import time
 import urllib.parse
@@ -11,6 +13,7 @@ from pathlib import Path
 
 from . import engine
 from .sanitize import sanitize_filename, unique_destination
+from .security import config_dir
 
 STATES = ("queued", "downloading", "paused", "completed", "error", "assembling", "canceled")
 
@@ -164,6 +167,7 @@ class Job:
         self._cancel_requested = True
         self._stop.set()
         self._remove_part_and_sidecar()
+        self._clear_secret_headers()
         thr = self._thread
         if not (thr and thr.is_alive()):
             self.state = "canceled"
@@ -171,6 +175,16 @@ class Job:
             self.finished = time.time()
             self._notify()
         # else: the running worker sets state="canceled" in _run on exit.
+
+    def _clear_secret_headers(self):
+        """Drop Cookie/Authorization from the job's headers (secrets at rest).
+
+        Rebinds self.headers to a new dict rather than mutating in place,
+        so an in-flight engine.download call holding the old dict
+        reference is unaffected.
+        """
+        self.headers = {k: v for k, v in self.headers.items()
+                        if k.lower() not in ("cookie", "authorization")}
 
     def _remove_part_and_sidecar(self):
         """Best-effort removal of the in-progress .part file and sidecars."""
@@ -274,12 +288,14 @@ class Job:
                 self.error = "canceled"
             else:
                 self.state = "completed"
+            self._clear_secret_headers()
             self.finished = time.time()
             self._notify()
         except engine.Paused:
             if self._cancel_requested:
                 self.state = "canceled"
                 self.error = "canceled"
+                self._clear_secret_headers()
                 self.finished = time.time()
             else:
                 self.state = "paused"
@@ -290,6 +306,7 @@ class Job:
                 # worker: the cancel intent still wins over "error".
                 self.state = "canceled"
                 self.error = "canceled"
+                self._clear_secret_headers()
                 self.finished = time.time()
                 self._notify()
             elif self.state != "error":
@@ -306,6 +323,13 @@ class Job:
         self.parts = parts
 
     def to_dict(self) -> dict:
+        # Finished jobs keep no secrets in queue.json: Cookie/Authorization
+        # are excluded for completed/canceled/error states. Active or
+        # interrupted (paused) jobs keep their headers so they can resume.
+        headers = self.headers
+        if self.state in ("completed", "canceled", "error"):
+            headers = {k: v for k, v in self.headers.items()
+                       if k.lower() not in ("cookie", "authorization")}
         return {
             "id": self.id,
             "url": self.url,
@@ -321,7 +345,7 @@ class Job:
             "error": self.error,
             "created": self.created,
             "finished": self.finished,
-            "headers": self.headers,
+            "headers": headers,
         }
 
     def as_row(self) -> dict:
@@ -363,8 +387,19 @@ class QueueManager:
                              if _TokenBucket is not None else None)
 
         if state_file is None:
-            base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-            sf = Path(base) / "opendm" / "queue.json"
+            sf = config_dir() / "queue.json"
+            if sys.platform == "win32":
+                # One-time migration: a queue.json written by the old
+                # POSIX-style location (~/.config/opendm/) moves to
+                # %APPDATA%\OpenDM on first run. Guarded by sys.platform;
+                # tested with mocks on Linux, unverified on real Windows.
+                legacy = Path(os.path.expanduser("~/.config")) / "opendm" / "queue.json"
+                if legacy.exists() and not sf.exists():
+                    try:
+                        sf.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(os.fspath(legacy), os.fspath(sf))
+                    except OSError:
+                        pass
         else:
             sf = Path(state_file)
         self.state_file = sf
