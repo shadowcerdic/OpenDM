@@ -104,14 +104,35 @@ def test_22a_sha256sums_fail_guard():
 
 def test_22c_all_pip_installs_exact_pinned():
     bad = []
+    req_refs = []
     for m in re.finditer(r"(?m)^\s*(?:&.*)?pip install\s+(.+?)\s*$", _text()):
         args = m.group(1)
         for tok in args.split():
             if tok.startswith("-") or tok == "pip":
+                if tok == "-r":
+                    req_refs.append("requirements")
+                continue
+            if tok.endswith(".txt"):
+                # `-r requirements.txt` reference (the -r was skipped above);
+                # validated separately below.
+                req_refs.append(tok)
                 continue
             if "==" not in tok:
                 bad.append(tok)
     assert not bad, f"unpinned pip packages: {bad}"
+    # A requirements-file reference is only acceptable if the file exists
+    # and every entry in it is an exact (==) pin.
+    assert req_refs, "expected at least one requirements-file reference"
+    req_path = Path(__file__).resolve().parents[1] / "requirements.txt"
+    assert req_path.is_file(), "requirements.txt referenced but missing"
+    unpinned = []
+    for line in req_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "==" not in line:
+            unpinned.append(line)
+    assert not unpinned, f"unpinned entries in requirements.txt: {unpinned}"
 
 
 def test_22d_embedded_python_zip_hash_verified():
