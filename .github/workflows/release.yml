@@ -15,10 +15,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Python for Testing & Staging
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
           cache: "pip"
@@ -26,7 +26,7 @@ jobs:
       - name: Install Test Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install PySide6 websockets pytest cryptography
+          pip install PySide6==6.12.0 websockets==17.2 pytest==9.1.1 cryptography==50.0.2
 
       - name: Run Test Suite (Build Integrity Check)
         run: |
@@ -36,15 +36,35 @@ jobs:
       - name: Prepare Staged Windows Runtime & Payload
         shell: pwsh
         run: |
+          # --- Pinned download hashes (spec item 22d) ---
+          # SHA-256 of the official python.org artifact
+          # python-3.12.8-embed-amd64.zip. Signature-verified 2026-10-14 via the
+          # published .sigstore bundle against the 3.12 release-manager identity
+          # thomas@python.org (python.org publishes .asc/.sigstore signatures
+          # but no plain-text checksum file). Re-verify against the .sigstore
+          # bundle before rotating this value.
+          $PYTHON_EMBED_SHA256 = "8d3f33be9eb810f23c102f08475af2854e50484b8e4e06275e937be61ce3d2fb"
+          # get-pip.py is a rolling file; bootstrap.pypa.io publishes NO official
+          # hash for it, so the expected value below cannot be filled from an
+          # authoritative source.
+          # INCOMPLETE (spec item 22d): fill GET_PIP_SHA256 once an official
+          # checksum is published, or vendor a content-addressed copy.
+          $GET_PIP_SHA256 = "TODO: fill from official bootstrap.pypa.io checksum"
+
           # 1. Create clean build_stage directories
           New-Item -ItemType Directory -Path "build_stage\python" -Force | Out-Null
           New-Item -ItemType Directory -Path "build_stage\app" -Force | Out-Null
           New-Item -ItemType Directory -Path "dist" -Force | Out-Null
 
-          # 2. Download Official Python 3.12 Embedded package
+          # 2. Download Official Python 3.12 Embedded package (hash-verified before use)
           $pyUrl = "https://www.python.org/ftp/python/3.12.8/python-3.12.8-embed-amd64.zip"
           Write-Host "Downloading Python Embeddable package: $pyUrl"
           Invoke-WebRequest -Uri $pyUrl -OutFile "python-embed.zip"
+          $actualEmbedHash = (Get-FileHash -Path "python-embed.zip" -Algorithm SHA256).Hash.ToLower()
+          if ($actualEmbedHash -ne $PYTHON_EMBED_SHA256.ToLower()) {
+            throw "SHA-256 MISMATCH for python-embed.zip: expected $($PYTHON_EMBED_SHA256), got $actualEmbedHash. Refusing to stage a tampered/corrupt runtime."
+          }
+          Write-Host "python-embed.zip SHA-256 verified."
           Expand-Archive -Path "python-embed.zip" -DestinationPath "build_stage\python" -Force
           Remove-Item "python-embed.zip"
 
@@ -53,13 +73,21 @@ jobs:
           $pthLines = @("python312.zip", ".", "Lib\site-packages", "..\app", "import site")
           Set-Content -Path $pthFile -Value $pthLines
 
-          # 4. Bootstrap pip into embedded python
-          Invoke-WebRequest -Uri "https://bootstrap.pypa.io/get-pip.py" -OutFile "get-pip.py"
+          # 4. Bootstrap pip into embedded python (versioned URL; hash-verified before use)
+          Invoke-WebRequest -Uri "https://bootstrap.pypa.io/pip/3.12/get-pip.py" -OutFile "get-pip.py"
+          $actualPipHash = (Get-FileHash -Path "get-pip.py" -Algorithm SHA256).Hash.ToLower()
+          if ($GET_PIP_SHA256 -notmatch "^[0-9a-fA-F]{64}$") {
+            Write-Warning "GET_PIP_SHA256 is not pinned (spec item 22d INCOMPLETE): skipping get-pip.py hash verification."
+          } elseif ($actualPipHash -ne $GET_PIP_SHA256.ToLower()) {
+            throw "SHA-256 MISMATCH for get-pip.py: expected $($GET_PIP_SHA256), got $actualPipHash. Refusing to run an unverified bootstrapper."
+          } else {
+            Write-Host "get-pip.py SHA-256 verified."
+          }
           & "build_stage\python\python.exe" get-pip.py --no-warn-script-location
           Remove-Item "get-pip.py"
 
           # 5. Install PySide6 and runtime dependencies into embedded environment
-          & "build_stage\python\python.exe" -m pip install --no-warn-script-location PySide6 websockets cryptography
+          & "build_stage\python\python.exe" -m pip install --no-warn-script-location PySide6==6.12.0 websockets==17.2 cryptography==50.0.2
 
           # 6. Copy OpenDM application files and Chrome extension
           Copy-Item -Path "opendm" -Destination "build_stage\app\opendm" -Recurse -Force
@@ -74,8 +102,17 @@ jobs:
           if (-not (Test-Path $iscc)) {
             $iscc = "C:\Program Files\Inno Setup 6\ISCC.exe"
           }
+          if (-not (Test-Path $iscc)) {
+            throw "Inno Setup 6 ISCC.exe not found at either expected path; cannot build the installer."
+          }
           Write-Host "Compiling installer using: $iscc"
           & $iscc "installer.iss"
+          if ($LASTEXITCODE -ne 0) {
+            throw "ISCC.exe failed with exit code $LASTEXITCODE; no installer was produced."
+          }
+          if (-not (Test-Path "dist\OpenDM-Setup.exe")) {
+            throw "ISCC.exe reported success but dist\OpenDM-Setup.exe is missing."
+          }
 
       - name: Package Chrome Extension .zip
         shell: pwsh
@@ -86,14 +123,54 @@ jobs:
         shell: pwsh
         working-directory: dist
         run: |
-          Get-ChildItem -Filter "*.exe", "*.zip" | ForEach-Object {
+          # NOTE: -Filter takes a SINGLE pattern only; the old
+          #   Get-ChildItem -Filter "*.exe", "*.zip"
+          # coerced the array to the single string "*.exe *.zip", matched
+          # nothing, and silently produced an EMPTY SHA256SUMS.txt.
+          # -Path accepts an array, so both extensions are enumerated.
+          $artifacts = Get-ChildItem -Path "*.exe", "*.zip"
+          if ($null -eq $artifacts -or $artifacts.Count -eq 0) {
+            throw "No .exe/.zip artifacts found in dist/; refusing to write an empty SHA256SUMS.txt."
+          }
+          $artifacts | ForEach-Object {
             $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLower()
             "$hash  $($_.Name)"
           } | Set-Content -Path "SHA256SUMS.txt"
+          $sums = Get-Content -Path "SHA256SUMS.txt" -Raw
+          if ([string]::IsNullOrWhiteSpace($sums)) {
+            throw "SHA256SUMS.txt is empty after generation."
+          }
+          foreach ($required in @("OpenDM-Setup.exe", "OpenDM-Chrome-Extension.zip")) {
+            if ($sums -notmatch [regex]::Escape($required)) {
+              throw "SHA256SUMS.txt has no checksum entry for $required."
+            }
+          }
           Get-Content "SHA256SUMS.txt"
 
+      - name: Verify Release Assets
+        shell: pwsh
+        run: |
+          # Fail fast BEFORE the release is created: softprops/action-gh-release
+          # creates the GitHub release first and uploads assets after, so a
+          # missing/empty asset here would otherwise publish a release with no
+          # installer (the v2.0.0 failure mode).
+          $required = @(
+            "dist\OpenDM-Setup.exe",
+            "dist\OpenDM-Chrome-Extension.zip",
+            "dist\SHA256SUMS.txt"
+          )
+          foreach ($f in $required) {
+            if (-not (Test-Path $f)) {
+              throw "Release asset missing: $f; refusing to publish an incomplete release."
+            }
+            if ((Get-Item $f).Length -eq 0) {
+              throw "Release asset is empty: $f; refusing to publish an incomplete release."
+            }
+          }
+          Write-Host "All release assets present and non-empty."
+
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             dist/OpenDM-Setup.exe
