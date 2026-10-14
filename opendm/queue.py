@@ -31,6 +31,35 @@ def category_for(filename: str) -> str:
     return "General"
 
 
+def _coerce_filename(url: str, suggested_filename: str | None) -> str:
+    """Derive a sanitized bare filename.
+
+    Precedence: sanitized suggested name (bare filename only)
+    > URL basename > default. Sanitized server-side regardless.
+    """
+    filename = None
+    if suggested_filename:
+        filename = sanitize_filename(
+            os.path.basename(suggested_filename.replace("\\", "/")) or "download.bin")
+    if not filename:
+        path_part = urllib.parse.urlparse(url).path
+        raw = os.path.basename(path_part) or "download.bin"
+        filename = sanitize_filename(raw)
+    return filename
+
+
+def _part_path(final_path: str) -> str:
+    """Path of the in-progress download file for a final destination.
+
+    Uses engine.part_path once the engine worker lands it; falls back to
+    the contracted "<final>.opendm.part" suffix.
+    """
+    pp = getattr(engine, "part_path", None)
+    if callable(pp):
+        return str(pp(final_path))
+    return str(final_path) + ".opendm.part"
+
+
 class Job:
     _next_id = 1
     _id_lock = threading.Lock()
@@ -45,6 +74,7 @@ class Job:
         state: str = "queued",
         filename: str | None = None,
         suggested_filename: str | None = None,
+        dest: str | None = None,
     ):
         with Job._id_lock:
             if job_id is not None:
@@ -61,20 +91,18 @@ class Job:
         self.headers = {k: v for k, v in (headers or {}).items()
                         if k.lower() in ("cookie", "referer", "user-agent", "authorization")}
 
-        # Filename precedence: sanitized suggested name (bare filename only)
-        # > URL basename > default. Sanitized server-side regardless.
-        if suggested_filename:
-            filename = sanitize_filename(
-                os.path.basename(suggested_filename.replace("\\", "/")) or "download.bin")
-        if not filename:
-            path_part = urllib.parse.urlparse(url).path
-            raw = os.path.basename(path_part) or "download.bin"
-            filename = sanitize_filename(raw)
-        self.filename = filename
+        self.filename = _coerce_filename(url, suggested_filename) if filename is None else filename
 
-        # Unique destination path (never overwrites existing file)
-        self.dest = str(unique_destination(dest_dir, self.filename)) if state == "queued" else os.path.join(dest_dir, self.filename)
-        self.filename = os.path.basename(self.dest)
+        if dest is not None:
+            # Destination pre-reserved by QueueManager (atomic); use as-is.
+            self.dest = str(dest)
+            self.filename = os.path.basename(self.dest)
+        else:
+            # Unique destination path (never overwrites existing file).
+            # NOTE: not atomic across threads; QueueManager.add() reserves
+            # atomically and passes dest explicitly.
+            self.dest = str(unique_destination(dest_dir, self.filename)) if state == "queued" else os.path.join(dest_dir, self.filename)
+            self.filename = os.path.basename(self.dest)
 
         self.category = category_for(self.filename)
         self.state = state
@@ -188,11 +216,18 @@ class Job:
 
 
 class QueueManager:
+    # Class-level lock making destination choice atomic across threads and
+    # across QueueManager instances sharing a directory.
+    _dest_lock = threading.Lock()
+
     def __init__(self, dest_dir: str, state_file: str | Path | None = None):
         self.dest_dir = dest_dir
         os.makedirs(dest_dir, exist_ok=True)
         self.jobs: list[Job] = []
         self.lock = threading.Lock()
+        # In-process reservation set (absolute final paths) so two queued jobs
+        # never pick the same destination even when nothing exists on disk yet.
+        self._reserved: set[str] = set()
 
         if state_file is None:
             base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
@@ -218,6 +253,7 @@ class QueueManager:
                     job_id=d.get("id"),
                     state="paused" if d.get("state") in ("downloading", "queued") else d.get("state", "paused"),
                     filename=d.get("filename"),
+                    dest=d.get("dest"),
                 )
                 j.total = d.get("total", 0)
                 j.done = d.get("done", 0)
@@ -226,8 +262,43 @@ class QueueManager:
                 j.dest = d.get("dest", j.dest)
                 j._on_change = self._save
                 self.jobs.append(j)
+                # Reserve names of jobs loaded from queue.json so new adds
+                # cannot collide with them.
+                with QueueManager._dest_lock:
+                    self._reserved.add(os.path.abspath(j.dest))
         except Exception:
             pass
+
+    def _reserve_destination(self, dest_dir: str, filename: str) -> str:
+        """Atomically pick a unique destination and reserve it.
+
+        Under the class-level lock, rejects a candidate when the final path
+        exists on disk, its .part file exists on disk, or it is already
+        reserved in-process; then exclusively creates the .part file
+        (O_CREAT|O_EXCL guards against races with other processes) and
+        records the reservation. Retries with a " (n)" suffix on collision.
+        """
+        d = Path(dest_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        stem = Path(filename).stem
+        suffix = Path(filename).suffix
+        with QueueManager._dest_lock:
+            i = 0
+            while True:
+                cand = d / filename if i == 0 else d / f"{stem} ({i}){suffix}"
+                part = _part_path(str(cand))
+                key = os.path.abspath(cand)
+                taken = cand.exists() or os.path.exists(part) or key in self._reserved
+                if not taken:
+                    try:
+                        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                    except FileExistsError:
+                        i += 1  # lost a cross-process race; try the next name
+                        continue
+                    os.close(fd)
+                    self._reserved.add(key)
+                    return str(cand)
+                i += 1
 
     def _save(self):
         with self.lock:
@@ -244,8 +315,11 @@ class QueueManager:
 
     def add(self, url: str, conns: int = 4, dest_dir: str | None = None,
             headers: dict | None = None, suggested_filename: str | None = None) -> Job:
-        job = Job(url, dest_dir or self.dest_dir, conns=conns, headers=headers,
-                  suggested_filename=suggested_filename)
+        dd = dest_dir or self.dest_dir
+        filename = _coerce_filename(url, suggested_filename)
+        dest = self._reserve_destination(dd, filename)
+        job = Job(url, dd, conns=conns, headers=headers,
+                  filename=filename, dest=dest)
         job._on_change = self._save
         with self.lock:
             self.jobs.append(job)

@@ -107,7 +107,17 @@ def test_updater_enqueues_into_opendm_engine(tmp_path):
     target_path = updater.get_update_target_path("v2.1.0")
     assert target_path.endswith("OpenDM-Setup-v2_1_0.exe") or target_path.endswith("OpenDM-Setup-v2.1.0.exe")
 
-    qm = QueueManager(str(tmp_path))
+    # Isolated state file: the default ~/.config/opendm/queue.json must not be
+    # used here (item 11 reserves names of jobs loaded from queue.json, so
+    # sharing the real state file across runs would change job.dest).
+    # Deterministic destination: drop reservation artifacts (.part) left in the
+    # system temp dir by previous runs; item 11 checks .part names on disk.
+    for stale in (target_path, target_path + ".opendm.part"):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+    qm = QueueManager(str(tmp_path), state_file=str(tmp_path / "queue.json"))
     job = qm.add(
         url="https://example.com/OpenDM-Setup.exe",
         conns=4,
