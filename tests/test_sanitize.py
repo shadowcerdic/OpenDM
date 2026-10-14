@@ -16,7 +16,51 @@ def test_sanitize_persian_and_unicode():
 
 def test_sanitize_query_and_fragment_chars():
     res = sanitize_filename("file?v=1&foo#bar.zip")
-    assert "?" not in res and "#" not in res
+    assert "?" not in res
+    assert "#" in res  # '#' is legal in filenames and must be kept
+    assert res.endswith(".zip")
+
+
+def test_sanitize_rlo_spoof():
+    # bidi controls must be stripped so the true extension is visible
+    assert sanitize_filename("evil\u202Etxt.exe") == "eviltxt.exe"
+    assert sanitize_filename("invoice\u202Efdp.exe") == "invoicefdp.exe"
+
+
+def test_sanitize_all_bidi_controls_stripped():
+    bidi = "\u202A\u202B\u202C\u202D\u202E\u2066\u2067\u2068\u2069\u200E\u200F\u061C"
+    assert sanitize_filename(bidi + "file.txt") == "file.txt"
+
+
+def test_sanitize_zero_width_stripped():
+    assert sanitize_filename("\u200Bfile.txt") == "file.txt"   # zero-width space
+    assert sanitize_filename("\uFEFFfile.txt") == "file.txt"  # BOM/ZWNBSP
+    assert sanitize_filename("fi\u2060le.txt") == "file.txt"  # word joiner
+
+
+def test_sanitize_zwnj_preserved():
+    # U+200C is required for correct Persian spelling
+    assert sanitize_filename("دانلود\u200cها.zip") == "دانلود\u200cها.zip"
+
+
+def test_sanitize_zwj_preserved():
+    # U+200D is required for correct Indic/Persian spelling
+    assert sanitize_filename("ab\u200dcd.txt") == "ab\u200dcd.txt"
+
+
+def test_sanitize_apostrophe_and_hash_kept():
+    assert sanitize_filename("it's #1.mp3") == "it's #1.mp3"
+
+
+def test_sanitize_nfc_normalization():
+    # decomposed e + combining acute must normalize to the composed form
+    assert sanitize_filename("e\u0301.txt") == "é.txt"
+
+
+def test_sanitize_utf8_byte_limit():
+    long_name = "پ" * 150 + ".zip"  # 304 UTF-8 bytes > 255
+    res = sanitize_filename(long_name)
+    assert len(res.encode("utf-8")) <= 255
     assert res.endswith(".zip")
 
 
