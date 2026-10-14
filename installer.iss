@@ -56,7 +56,7 @@ Root: HKCU; Subkey: "Software\Microsoft\Edge\NativeMessagingHosts\org.opendm.nat
 [Code]
 // Fill the {app} placeholder in org.opendm.native_host.json with the real
 // install directory so the native-messaging manifest points at this install.
-function EscapeJsonBackslashes(const S: String): String;
+function EscapeJsonBackslashes(const S: AnsiString): AnsiString;
 var
   i: Integer;
 begin
@@ -72,7 +72,8 @@ end;
 
 procedure RenderNativeHostManifest();
 var
-  ManifestPath, Content, InstallDir: String;
+  ManifestPath, InstallDir: String;
+  Content: AnsiString;
 begin
   ManifestPath := ExpandConstant('{app}\app\opendm\org.opendm.native_host.json');
   if not LoadStringFromFile(ManifestPath, Content) then
