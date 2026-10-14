@@ -105,6 +105,87 @@ def _interruptible_sleep(stop_event: threading.Event | None,
         time.sleep(min(0.2, t_end - time.time()))
 
 
+class TokenBucket:
+    """Thread-safe token-bucket rate limiter with a live-adjustable limit.
+
+    Tokens accrue at ``bytes_per_sec`` (no initial burst); consume(n) blocks
+    until n tokens are available. A limit of 0 (or negative) means unlimited.
+    Shared across worker threads: pass one instance to download() as
+    ``rate_limiter``.
+    """
+
+    def __init__(self, bytes_per_sec: float = 0):
+        self._lock = threading.Lock()
+        self._limit = 0.0
+        self._tokens = 0.0
+        self._last = time.monotonic()
+        self.set_limit(bytes_per_sec)
+
+    def set_limit(self, bytes_per_sec: float):
+        """Change the rate limit live (bytes/sec; 0 = unlimited)."""
+        with self._lock:
+            self._refill()
+            self._limit = max(0.0, float(bytes_per_sec or 0))
+
+    def consume(self, n: int):
+        """Block until n bytes may be transferred."""
+        n = int(n)
+        if n <= 0:
+            return
+        while n > 0:
+            with self._lock:
+                self._refill()
+                if self._limit <= 0:
+                    return
+                # Take whatever is available; large requests are satisfied
+                # in pieces so n > burst cap can never deadlock.
+                take = min(n, self._tokens)
+                if take > 0:
+                    self._tokens -= take
+                    n -= take
+                    if n <= 0:
+                        return
+                wait = max(n, 1) / self._limit
+            # Sleep outside the lock in small slices so set_limit() and
+            # pause/abort paths stay responsive.
+            time.sleep(min(wait, 0.05))
+
+    def _refill(self):
+        now = time.monotonic()
+        if self._limit > 0:
+            # Cap accumulated burst at one second of tokens.
+            self._tokens = min(self._limit,
+                               self._tokens + (now - self._last) * self._limit)
+        self._last = now
+
+
+class _SlidingRate:
+    """Sliding-window byte rate over the last ~window seconds."""
+
+    def __init__(self, window: float = 3.0):
+        self._window = window
+        self._samples: collections.deque = collections.deque()
+        self._lock = threading.Lock()
+
+    def add(self, n: int):
+        now = time.monotonic()
+        with self._lock:
+            self._samples.append((now, n))
+            self._evict(now)
+
+    def rate(self) -> float:
+        now = time.monotonic()
+        with self._lock:
+            self._evict(now)
+            total = sum(b for _, b in self._samples)
+        return total / self._window
+
+    def _evict(self, now: float):
+        cutoff = now - self._window
+        while self._samples and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+
+
 class Segment:
     """Represents a range chunk [start, end] with dynamic cursor and boundary."""
 
@@ -638,6 +719,8 @@ def download(
     speed_limit: int = 0,
     headers: dict | None = None,
     proxy: str | None = None,
+    rate_limiter: TokenBucket | None = None,
+    rate_cb: Callable[[float], None] | None = None,
 ) -> dict:
     """v2.0 Pre-allocated, lock-free parallel download with Work Stealing."""
     conns = max(1, min(int(conns), MAX_CONNS))
@@ -724,19 +807,27 @@ def download(
     # Calculate initial done bytes (includes resumed bytes).
     done = [sum(s.have for s in segments)]
 
+    # Rate limiting: an explicitly passed TokenBucket wins; otherwise the
+    # legacy speed_limit is wrapped in a TokenBucket for backward compatibility.
+    bucket = rate_limiter
+    if bucket is None and speed_limit:
+        bucket = TokenBucket(speed_limit)
+
+    # Sliding-window rate over bytes transferred *this session* only.
+    session_rate = _SlidingRate(window=3.0)
+
     limit_lock = threading.Lock()
-    limit_t0 = [time.time()]
-    limit_bytes = [0]
 
     def throttled_on_bytes(n):
         with limit_lock:
             done[0] += n
-            limit_bytes[0] += n
-        if speed_limit:
-            while limit_bytes[0] / max(time.time() - limit_t0[0], 1e-3) > speed_limit:
-                time.sleep(0.01)
+        if bucket is not None:
+            bucket.consume(n)
+        session_rate.add(n)
         if status_cb:
             status_cb(done[0], total, time.time() - t0)
+        if rate_cb is not None:
+            rate_cb(session_rate.rate())
 
     def emit_parts():
         if parts_cb:

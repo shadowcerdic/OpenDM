@@ -789,3 +789,123 @@ def test_resume_pending_queue_limits_workers(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Item 8: TokenBucket rate limiter (live-adjustable) + sliding-window rate
+# reporting of session-only bytes.
+# ---------------------------------------------------------------------------
+
+def test_token_bucket_limits_rate():
+    """consume() blocks until tokens accrue at the configured rate."""
+    b = engine.TokenBucket(100_000)
+    t0 = time.time()
+    b.consume(200_000)
+    dt = time.time() - t0
+    assert 1.7 <= dt <= 2.8, f"expected ~2s for 200KB @ 100KB/s, took {dt:.2f}s"
+
+
+def test_token_bucket_set_limit_live():
+    """set_limit() changes the rate without recreating the bucket."""
+    b = engine.TokenBucket(100_000)
+    b.set_limit(400_000)
+    t0 = time.time()
+    b.consume(200_000)
+    dt = time.time() - t0
+    assert dt < 1.0, f"expected ~0.5s after set_limit(400KB/s), took {dt:.2f}s"
+
+
+def test_token_bucket_unlimited():
+    """Limit 0 means no throttling."""
+    b = engine.TokenBucket(0)
+    t0 = time.time()
+    b.consume(10_000_000)
+    assert time.time() - t0 < 0.5
+
+
+def test_speed_limit_param_still_works(tmp_path):
+    """Legacy speed_limit kwarg still throttles (wrapped in a TokenBucket)."""
+    with make_server({}) as server:
+        dest = str(tmp_path / "sl.bin")
+        stop = threading.Event()
+        seen = {"done": 0}
+
+        def status_cb(d, total, dt):
+            seen["done"] = d
+
+        def run():
+            try:
+                engine.download(server.url("/file.bin"), dest=dest, conns=4,
+                                stop_event=stop, status_cb=status_cb,
+                                speed_limit=100 * 1024)
+            except engine.Paused:
+                pass
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        time.sleep(2.5)
+        stop.set()
+        t.join(timeout=15)
+        d = seen["done"]
+        assert d > 50 * 1024, f"no progress under speed_limit ({d} bytes)"
+        assert d < 450 * 1024, f"speed_limit not honored ({d} bytes in 2.5s)"
+
+
+def test_rate_limiter_param_used(tmp_path):
+    """An explicitly passed TokenBucket throttles the download."""
+    with make_server({}) as server:
+        dest = str(tmp_path / "rl2.bin")
+        stop = threading.Event()
+        seen = {"done": 0}
+
+        def run():
+            try:
+                engine.download(
+                    server.url("/file.bin"), dest=dest, conns=4,
+                    stop_event=stop,
+                    status_cb=lambda d, t, dt: seen.update(done=d),
+                    rate_limiter=engine.TokenBucket(100 * 1024))
+            except engine.Paused:
+                pass
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        time.sleep(2.5)
+        stop.set()
+        t.join(timeout=15)
+        d = seen["done"]
+        assert d > 50 * 1024, f"no progress with rate_limiter ({d} bytes)"
+        assert d < 450 * 1024, f"rate_limiter not honored ({d} bytes in 2.5s)"
+
+
+def test_sliding_rate_window_expiry():
+    """Samples older than the window stop contributing to the rate."""
+    r = engine._SlidingRate(window=0.3)
+    r.add(3000)
+    assert r.rate() > 0
+    time.sleep(0.4)
+    assert r.rate() == 0.0
+
+
+def test_reported_rate_excludes_resumed_bytes(tmp_path):
+    """rate_cb reports session-only bytes: first samples after a resume are
+    near zero, not inflated by the already-downloaded bytes."""
+    with make_server({"slow": 0.05}) as server:
+        url = server.url("/file.bin")
+        dest = str(tmp_path / "rt.bin")
+        stop = threading.Event()
+        threading.Timer(1.5, stop.set).start()
+        try:
+            engine.download(url, dest=dest, conns=2, stop_event=stop)
+        except engine.Paused:
+            pass
+        sc = engine.load_sidecar(dest)
+        resumed = sum(s["cursor"] - s["start"] for s in sc["segments"])
+        assert resumed > 512 * 1024, "pause did not download enough to matter"
+        server.cfg["slow"] = 0
+        samples = []
+        res = engine.download(url, dest=dest, conns=2, rate_cb=samples.append)
+        assert res["sha256"] == PAYLOAD_SHA256
+        assert samples, "rate_cb was never called"
+        assert samples[0] < 2 * 1024 * 1024, \
+            f"first rate sample inflated by resumed bytes: {samples[0]:,.0f} B/s"
+
+
+# ---------------------------------------------------------------------------
