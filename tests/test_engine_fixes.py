@@ -129,6 +129,9 @@ def test_206_content_range_start_match_ok(tmp_path):
         n = engine._fetch_chunk(server.url("/file.bin"), 0, 4095, dest)
         assert n == 4096
         assert open(dest, "rb").read() == PAYLOAD[:4096]
+
+
+# ---------------------------------------------------------------------------
 # Item 2: retry policy — 4xx (except 408/429) non-retryable, Retry-After honored,
 # disk OSErrors (ENOSPC/EACCES) surface immediately
 # ---------------------------------------------------------------------------
@@ -334,7 +337,7 @@ def test_resume_falls_back_to_last_modified(tmp_path, monkeypatch):
     with make_server({}) as server:
         url = server.url("/file.bin")
         dest = str(tmp_path / "lm.bin")
-        engine.preallocate_file(dest, len(PAYLOAD))
+        engine.preallocate_file(engine.part_path(dest), len(PAYLOAD))
         seg = engine.Segment(0, 0, len(PAYLOAD) - 1, cursor=1024)
         engine.save_sidecar(dest, {
             "url": url, "total": len(PAYLOAD), "etag": None,
@@ -360,7 +363,7 @@ def test_resume_last_modified_match_continues(tmp_path, monkeypatch):
     with make_server({}) as server:
         url = server.url("/file.bin")
         dest = str(tmp_path / "lm2.bin")
-        engine.preallocate_file(dest, len(PAYLOAD))
+        engine.preallocate_file(engine.part_path(dest), len(PAYLOAD))
         seg = engine.Segment(0, 0, len(PAYLOAD) - 1, cursor=0)
         engine.save_sidecar(dest, {
             "url": url, "total": len(PAYLOAD), "etag": None,
@@ -771,7 +774,7 @@ def test_resume_pending_queue_limits_workers(tmp_path, monkeypatch):
     with make_server({"slow": 0.02}) as server:
         url = server.url("/file.bin")
         dest = str(tmp_path / "pq.bin")
-        engine.preallocate_file(dest, len(PAYLOAD))
+        engine.preallocate_file(engine.part_path(dest), len(PAYLOAD))
         ranges = engine.plan_ranges(len(PAYLOAD), 20)
         segs = [engine.Segment(i, s, e, cursor=s) for i, (s, e) in enumerate(ranges)]
         assert len(segs) == 20
@@ -1032,3 +1035,78 @@ def test_redirect_to_non_http_blocked():
 
 
 # ---------------------------------------------------------------------------
+# Item 10: partial-file safety — download() writes to <final>.opendm.part,
+# preallocates with a disk-space check, and os.replace()s to the final name
+# only after the completion gate passes.
+# ---------------------------------------------------------------------------
+
+def test_part_path_helper():
+    assert engine.part_path("/a/b.bin") == "/a/b.bin.opendm.part"
+    assert engine.part_path("rel.bin") == "rel.bin.opendm.part"
+
+
+def test_download_writes_part_and_renames_on_completion(tmp_path):
+    """Mid-download: final absent, .part present+preallocated. After
+    completion: final present with correct sha, .part gone, file==final."""
+    with make_server({"slow": 0.05}) as server:
+        url = server.url("/file.bin")
+        dest = str(tmp_path / "final.bin")
+        part = engine.part_path(dest)
+        stop = threading.Event()
+        threading.Timer(1.5, stop.set).start()
+        try:
+            engine.download(url, dest=dest, conns=2, stop_event=stop)
+        except engine.Paused:
+            pass
+        assert not os.path.exists(dest), "final name must not exist mid-download"
+        assert os.path.exists(part), ".part file must exist mid-download"
+        assert os.path.getsize(part) == len(PAYLOAD), ".part must be preallocated"
+        assert engine.load_sidecar(dest) is not None
+
+        server.cfg["slow"] = 0
+        res = engine.download(url, dest=dest, conns=2)
+        assert res["file"] == dest, "returned file must be the final path"
+        assert res["sha256"] == PAYLOAD_SHA256
+        assert os.path.exists(dest), "final name must exist after completion"
+        assert not os.path.exists(part), ".part must be gone after completion"
+        assert not os.path.exists(engine.get_sidecar_path(dest))
+
+
+def test_insufficient_disk_space_clear_error(tmp_path, monkeypatch):
+    """shutil.disk_usage reporting too little free space -> clear OSError."""
+    import shutil
+    from collections import namedtuple
+    real_disk_usage = shutil.disk_usage
+    Usage = namedtuple("Usage", ["total", "used", "free"])
+
+    def fake_disk_usage(path):
+        u = real_disk_usage(path)
+        return Usage(u.total, u.used, 1024)
+
+    monkeypatch.setattr(shutil, "disk_usage", fake_disk_usage)
+    with make_server({}) as server:
+        with pytest.raises(OSError, match="(?i)disk space|no space"):
+            engine.download(server.url("/file.bin"),
+                            dest=str(tmp_path / "nospace.bin"), conns=1)
+
+
+def test_resume_continues_from_part_and_sidecar(tmp_path):
+    """A paused download resumes from the .part file + sidecar to full sha."""
+    with make_server({"slow": 0.05}) as server:
+        url = server.url("/file.bin")
+        dest = str(tmp_path / "rsm.bin")
+        stop = threading.Event()
+        threading.Timer(1.0, stop.set).start()
+        try:
+            engine.download(url, dest=dest, conns=2, stop_event=stop)
+        except engine.Paused:
+            pass
+        part = engine.part_path(dest)
+        assert os.path.exists(part)
+        sc = engine.load_sidecar(dest)
+        have_before = sum(s["cursor"] - s["start"] for s in sc["segments"])
+        assert have_before > 0
+        server.cfg["slow"] = 0
+        res = engine.download(url, dest=dest, conns=2)
+        assert res["sha256"] == PAYLOAD_SHA256
+        assert res["file"] == dest

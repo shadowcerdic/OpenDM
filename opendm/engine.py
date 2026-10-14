@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -28,11 +29,10 @@ from typing import Callable
 from .sanitize import parse_content_disposition, sanitize_filename
 
 UA = "OpenDM/2.0"
-
-MAX_CONNS = 16  # hard cap on parallel connections/workers
 PART_DIR = ".opendm"
 MIN_SPLIT_SIZE = 2 * 1024 * 1024  # 2 MB minimum remaining for work stealing
 PAGE_SIZE = 4096
+MAX_CONNS = 16  # hard cap on parallel connections/workers
 
 
 class Paused(Exception):
@@ -327,6 +327,15 @@ def get_sidecar_path(target_path: str) -> str:
     return f"{target_path}.opendm"
 
 
+def part_path(final_path: str) -> str:
+    """Return the in-progress partial-file path for a final destination.
+
+    download() writes to this path and atomically renames it to the final
+    name (os.replace) only after the completion gate passes.
+    """
+    return f"{final_path}.opendm.part"
+
+
 def save_sidecar(target_path: str, data: dict):
     """Atomically write sidecar metadata via a unique temp file.
 
@@ -399,13 +408,24 @@ def steal_work(segments: list[Segment], lock: threading.Lock,
 
 
 def preallocate_file(filepath: str, size: int):
-    """Pre-allocate file on disk to exact size if it doesn't exist or differs."""
+    """Pre-allocate file on disk to exact size if it doesn't exist or differs.
+
+    Checks free disk space with shutil.disk_usage before growing the file and
+    raises a clear OSError when there is not enough room.
+    """
     parent = os.path.dirname(os.path.abspath(filepath))
     os.makedirs(parent, exist_ok=True)
-    if os.path.exists(filepath):
-        cur_size = os.path.getsize(filepath)
-        if cur_size == size:
-            return
+    existing = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+    if existing == size:
+        return
+    need = max(0, size - existing)
+    if need > 0:
+        free = shutil.disk_usage(parent).free
+        if free < need:
+            raise OSError(
+                errno.ENOSPC,
+                f"Insufficient disk space for {filepath}: need {need} bytes, "
+                f"only {free} bytes free on {parent}")
     with open(filepath, "a+b") as f:
         if size > 0:
             f.truncate(size)
@@ -589,10 +609,6 @@ def _download_single_segment(
                             f"server answered {cr!r}"
                         )
 
-                # Resume Integrity: Check If-Range mismatch
-                if etag and r.status == 200 and pos > 0:
-                    raise RemoteFileChanged("Server returned 200 on range request with If-Range; file changed.")
-
                 # A 200 on segment 0 is a full stream only when the plan has
                 # exactly one segment; otherwise the server is ignoring Range
                 # and the stream would overwrite sibling segments.
@@ -732,8 +748,7 @@ def _fetch_chunk(url: str, start: int, end: int, part_path: str,
             url=url, seg=seg, fd=fd, seg_lock=lock,
             stop_event=stop_event, on_bytes=on_bytes,
             extra_headers=extra_headers, etag=None, last_modified=None,
-            meta_saver=None,
-            max_retries=max_retries
+            meta_saver=None, max_retries=max_retries
         )
     return seg.have
 
@@ -769,8 +784,12 @@ def download(
     else:
         name = dest
 
-    # Pre-allocation on target file
-    preallocate_file(name, total)
+    # Partial-file safety: all bytes go to <final>.opendm.part; the final
+    # name appears only after the completion gate passes (os.replace).
+    part = part_path(name)
+
+    # Pre-allocation on the .part file (with a free-space check).
+    preallocate_file(part, total)
 
     # Legacy compatibility: ensure PART_DIR exists if checked
     workdir = os.path.join(os.path.dirname(os.path.abspath(name)), PART_DIR)
@@ -780,9 +799,11 @@ def download(
     sidecar = load_sidecar(name)
     seg_lock = threading.Lock()
 
-    # Resume verification & segment loading
+    # Resume verification & segment loading (requires the .part file too).
     segments: list[Segment] = []
-    if sidecar and sidecar.get("url") == url and sidecar.get("total") == total:
+    if (sidecar and sidecar.get("url") == url
+            and sidecar.get("total") == total
+            and os.path.exists(part)):
         # Resume validation: strong ETag first, falling back to Last-Modified
         # when the ETag is absent on either side.
         saved_etag = sidecar.get("etag")
@@ -884,7 +905,7 @@ def download(
             _worker_loop(
                 url=url,
                 seg=initial_seg,
-                dest_path=name,
+                dest_path=part,
                 segments=segments,
                 seg_lock=seg_lock,
                 stop_event=stop_event,
@@ -965,8 +986,12 @@ def download(
     if state_cb:
         state_cb("verifying")
 
-    actual_size = total if total > 0 else os.path.getsize(name)
-    sha = compute_sha256(name, actual_size)
+    actual_size = total if total > 0 else os.path.getsize(part)
+    sha = compute_sha256(part, actual_size)
+
+    # Completion gate passed: atomically publish the .part as the final name.
+    # The final name never exists before this point.
+    os.replace(part, name)
 
     # Clean up sidecar file on verified completion
     sidecar_path = get_sidecar_path(name)
