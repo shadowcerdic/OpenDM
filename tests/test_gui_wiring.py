@@ -283,3 +283,123 @@ def test_no_plain_httpserver_import_in_source():
     src = open(os.path.join(os.path.dirname(gui.__file__), "gui.py"), encoding="utf-8").read()
     assert "from http.server import HTTPServer" not in src
     assert "HTTPServer(" not in src.replace("ThreadedHTTPServer(", "")
+
+
+# ---------------------------------------------------------------------------
+# Card-layout redesign — new behavior
+# ---------------------------------------------------------------------------
+class StubJob:
+    """Minimal stand-in for queue.Job with the attributes DownloadCard uses."""
+
+    def __init__(self, jid, filename, state, category="General", total=100, done=0):
+        self.id = jid
+        self.filename = filename
+        self.state = state
+        self.category = category
+        self.total = total
+        self.done = done
+        self.speed_avg = 0
+        self.sha256 = ""
+        self.parts = []
+        self.url = "https://example.com/" + filename
+        self.dest = "/tmp/" + filename
+
+    def pause(self):
+        self.state = "paused"
+
+    def resume(self):
+        self.state = "downloading"
+
+    def cancel(self):
+        self.state = "canceled"
+
+
+def _jobs():
+    return [
+        StubJob("j1", "ubuntu.iso", "downloading", "Compressed", 1000, 620),
+        StubJob("j2", "report.pdf", "paused", "Documents", 100, 62),
+        StubJob("j3", "setup.exe", "completed", "Programs", 100, 100),
+    ]
+
+
+def test_card_grid_shows_all_jobs(win):
+    win.qm.jobs = _jobs()
+    win.refresh_rows()
+    assert len(win._cards_by_id) == 3
+    assert win.subtitle_lbl.text() == "Showing 3 of 3"
+    assert not win.scroll_area.isHidden()
+    assert win.empty_widget.isHidden()
+
+
+def test_empty_state_shows_when_no_jobs(win):
+    win.qm.jobs = []
+    win.refresh_rows()
+    assert len(win._cards_by_id) == 0
+    assert win.scroll_area.isHidden()
+    assert not win.empty_widget.isHidden()
+
+
+def test_search_filters_cards(win):
+    win.qm.jobs = _jobs()
+    win.search_box.setText("ubuntu")
+    win.refresh_rows()
+    assert set(win._cards_by_id) == {"j1"}
+    assert win.subtitle_lbl.text() == "Showing 1 of 3"
+
+
+def test_library_filter_active(win):
+    win.qm.jobs = _jobs()
+    win.set_category("Active")
+    assert set(win._cards_by_id) == {"j1"}
+    assert win.selected_category == "Active"
+
+
+def test_category_filter_archives(win):
+    win.qm.jobs = _jobs()
+    win.set_category("Compressed")
+    assert set(win._cards_by_id) == {"j1"}
+
+
+def test_sidebar_badges_count_jobs(win):
+    win.qm.jobs = _jobs()
+    win.refresh_rows()
+    assert win.nav_items["All"].badge.text() == "3"
+    assert win.nav_items["Active"].badge.text() == "1"
+    assert win.nav_items["Completed"].badge.text() == "1"
+    assert win.nav_items["Queued"].badge.text() == "0"
+    assert win.nav_items["Compressed"].badge.text() == "1"
+
+
+def test_pause_all_pauses_only_downloading(win):
+    jobs = _jobs()
+    win.qm.jobs = jobs
+    win.pause_all()
+    assert jobs[0].state == "paused"
+    assert jobs[1].state == "paused"      # untouched
+    assert jobs[2].state == "completed"   # untouched
+
+
+def test_card_selection_tracks_selected_job(win):
+    win.qm.jobs = _jobs()
+    win.refresh_rows()
+    card = win._cards_by_id["j2"]
+    card.clicked.emit(card.job)
+    assert win._selected_job() is card.job
+    assert card.property("selected") is True
+    assert win._cards_by_id["j1"].property("selected") is False
+
+
+def test_sort_by_name_orders_cards(win):
+    win.qm.jobs = _jobs()
+    win.sort_combo.setCurrentIndex(win.sort_combo.findData("name"))
+    win.refresh_rows()
+    names = [win._cards_by_id[jid].job.filename
+             for jid in win._last_layout_ids]
+    assert names == sorted(names, key=str.lower)
+
+
+def test_speed_pill_reflects_limit_changes(win, fake_qm):
+    win.qm = fake_qm
+    win._on_speed_slider_changed(5)
+    assert win.speed_slider_lbl.text() == "5 MB/s"
+    assert not win.speed_pill.isHidden()

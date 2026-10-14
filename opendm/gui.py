@@ -19,10 +19,11 @@ import sys
 import threading
 import time
 from pathlib import Path
+import shutil
 
-from PySide6.QtCore import Qt, QTimer, QSize, QRectF, Signal, QObject
+from PySide6.QtCore import Qt, QTimer, QSize, QRectF, Signal, QObject, QPoint
 from PySide6.QtGui import (
-    QAction, QColor, QIcon, QPainter, QFont, QPen, QBrush,
+    QAction, QColor, QIcon, QPainter, QFont, QFontMetrics, QPen, QBrush,
     QKeySequence, QPixmap, QPainterPath
 )
 from PySide6.QtWidgets import (
@@ -31,7 +32,8 @@ from PySide6.QtWidgets import (
     QLineEdit, QComboBox, QSpinBox, QDialog, QToolBar, QStatusBar,
     QHeaderView, QStyledItemDelegate, QStyleOptionViewItem, QMessageBox,
     QFileDialog, QDialogButtonBox, QPlainTextEdit, QFrame, QSplitter,
-    QSystemTrayIcon, QSlider, QCheckBox, QFormLayout
+    QSystemTrayIcon, QSlider, QCheckBox, QFormLayout, QToolButton,
+    QScrollArea, QGridLayout
 )
 
 from .queue import QueueManager, STATES
@@ -106,6 +108,30 @@ def make_icon(icon_type: str, color: str = "#e2e8f0", size: int = 24) -> QIcon:
         painter.drawLine(12, 7, 12, 15)
         painter.drawLine(8, 11, 12, 15)
         painter.drawLine(16, 11, 12, 15)
+    elif icon_type == "check":
+        painter.drawLine(7, 13, 11, 17)
+        painter.drawLine(11, 17, 18, 7)
+    elif icon_type == "clock":
+        painter.drawEllipse(5, 5, 14, 14)
+        painter.drawLine(12, 8, 12, 12)
+        painter.drawLine(12, 12, 15, 14)
+    elif icon_type == "gear":
+        painter.drawEllipse(9, 9, 6, 6)
+        for _cx, _cy, _dx, _dy in (
+            (12, 3, 12, 6), (12, 18, 12, 21), (3, 12, 6, 12), (18, 12, 21, 12),
+            (6, 6, 8, 8), (16, 16, 18, 18), (18, 6, 16, 8), (8, 16, 6, 18),
+        ):
+            painter.drawLine(_cx, _cy, _dx, _dy)
+    elif icon_type == "search":
+        painter.drawEllipse(5, 5, 12, 12)
+        painter.drawLine(14, 14, 20, 20)
+    elif icon_type == "gauge":
+        _path = QPainterPath()
+        _path.arcMoveTo(QRectF(4, 6, 16, 16), 180)
+        _path.arcTo(QRectF(4, 6, 16, 16), 180, 180)
+        painter.drawPath(_path)
+        painter.drawLine(12, 14, 17, 9)
+        painter.drawPoint(12, 14)
     painter.end()
     return QIcon(pix)
 
@@ -430,6 +456,358 @@ def update_no_hash_notice_line(html_url: str | None) -> str:
 
 
 # -----------------------------------------------------------------------------
+# Card-layout redesign — metadata, helpers and widgets
+# -----------------------------------------------------------------------------
+
+STATUS_META = {
+    "downloading": ("Downloading", "#3b82f6"),
+    "paused":      ("Paused",      "#f59e0b"),
+    "completed":   ("Completed",   "#22c55e"),
+    "error":       ("Error",       "#ef4444"),
+    "canceled":    ("Canceled",    "#64748b"),
+    "queued":      ("Queued",      "#94a3b8"),
+}
+
+# category key -> (display label, badge color)
+CATEGORY_META = {
+    "Compressed": ("Archives",  "#f59e0b"),
+    "Video":      ("Media",     "#a78bfa"),
+    "Music":      ("Music",     "#38bdf8"),
+    "Documents":  ("Documents", "#34d399"),
+    "Programs":   ("Programs",  "#f472b6"),
+    "General":    ("Other",     "#64748b"),
+}
+
+LIBRARY_ITEMS = [
+    ("All",       "All Downloads", "app",   "#38bdf8"),
+    ("Active",    "Active",        "play",  "#22c55e"),
+    ("Completed", "Completed",     "check", "#22c55e"),
+    ("Queued",    "Queued",        "clock", "#94a3b8"),
+]
+
+
+def _fmt_size(num):
+    """Human-readable byte size (MB/GB), '—' when unknown."""
+    if not num:
+        return "—"
+    gb = 1024 ** 3
+    mb = 1024 ** 2
+    if num >= gb:
+        return f"{num / gb:.1f} GB"
+    return f"{num / mb:.1f} MB"
+
+
+def _fmt_eta(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s left"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60:02d}s left"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m left"
+
+
+def _with_alpha(hex_color, alpha_hex):
+    """Apply alpha to a #RRGGBB color for Qt stylesheets (which use #AARRGGBB)."""
+    return f"#{alpha_hex}{hex_color[1:]}"
+
+
+class ClickableFrame(QFrame):
+    """QFrame that emits clicked on left mouse press (for pill-style buttons)."""
+
+    clicked = Signal()
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(ev)
+
+
+class SegmentBar(QWidget):
+    """Thin per-connection segment progress bar — OpenDM's signature visual."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(8)
+        self._parts = []
+        self._total = 0
+        self._done = 0
+        self._color = "#3b82f6"
+
+    def set_job(self, job):
+        self._parts = list(getattr(job, "parts", None) or [])
+        self._total = getattr(job, "total", 0) or 0
+        self._done = getattr(job, "done", 0) or 0
+        state = (getattr(job, "state", "") or "").lower()
+        self._color = STATUS_META.get(state, ("", "#3b82f6"))[1]
+        self.update()
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = float(self.width()), float(self.height())
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#1e293b"))
+        p.drawRoundedRect(QRectF(0, 0, w, h), h / 2.0, h / 2.0)
+        if self._total > 0:
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(0, 0, w, h), h / 2.0, h / 2.0)
+            p.setClipPath(path)
+            color = QColor(self._color)
+            if self._parts:
+                x = 0.0
+                for part in self._parts:
+                    s = part.get("start", 0)
+                    e = part.get("end", 0)
+                    seg = max(e - s + 1, 1)
+                    have = max(0, min(part.get("have", 0), seg))
+                    seg_w = w * seg / self._total
+                    if have > 0:
+                        p.setBrush(color)
+                        p.drawRect(QRectF(x, 0.0, seg_w * have / seg, h))
+                    x += seg_w
+                    p.setBrush(QColor("#0b0f19"))
+                    p.drawRect(QRectF(x, 0.0, 1.0, h))
+                    x += 1.0
+            else:
+                frac = max(0.0, min(1.0, self._done / self._total))
+                if frac > 0:
+                    p.setBrush(color)
+                    p.drawRect(QRectF(0.0, 0.0, w * frac, h))
+        p.end()
+
+
+class StatusPill(QLabel):
+    """Small colored status badge."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.set_status("queued")
+
+    def set_status(self, state):
+        label, color = STATUS_META.get(state, (state.capitalize(), "#94a3b8"))
+        self.setText(label)
+        self.setStyleSheet(
+            f"background: {_with_alpha(color, '26')}; color: {color};"
+            f" border: 1px solid {_with_alpha(color, '66')};"
+            " border-radius: 9px; padding: 2px 10px; font-size: 11px; font-weight: 600;"
+        )
+
+
+class FileBadge(QLabel):
+    """Rounded file-type badge showing the extension."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(46, 46)
+        self.setAlignment(Qt.AlignCenter)
+
+    def set_file(self, filename, category):
+        ext = filename.rsplit(".", 1)[-1].upper()[:4] if "." in filename else "FILE"
+        color = CATEGORY_META.get(category, ("", "#64748b"))[1]
+        self.setText(ext)
+        self.setStyleSheet(
+            f"background: {_with_alpha(color, '26')}; color: {color};"
+            " border-radius: 10px; font-size: 11px; font-weight: 800;"
+        )
+
+
+class NavItem(QWidget):
+    """Sidebar navigation row with icon/dot, label and count badge."""
+
+    clicked = Signal(str)
+
+    def __init__(self, key, label, icon=None, color="#94a3b8", show_badge=True, parent=None):
+        super().__init__(parent)
+        self.key = key
+        self._show_badge = show_badge
+        self.setObjectName("NavItem")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setProperty("selected", False)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 7, 10, 7)
+        lay.setSpacing(10)
+        if icon:
+            il = QLabel()
+            il.setPixmap(make_icon(icon, color, 16).pixmap(16, 16))
+            lay.addWidget(il)
+        else:
+            dot = QLabel()
+            dot.setFixedSize(10, 10)
+            dot.setStyleSheet(f"background: {color}; border-radius: 5px;")
+            dot.setAttribute(Qt.WA_TransparentForMouseEvents)
+            lay.addWidget(dot)
+        text = QLabel(label)
+        text.setAttribute(Qt.WA_TransparentForMouseEvents)
+        lay.addWidget(text, 1)
+        self.badge = QLabel("0")
+        self.badge.setObjectName("NavBadge")
+        self.badge.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.badge.setVisible(False)
+        lay.addWidget(self.badge)
+
+    def set_count(self, n):
+        self.badge.setText(str(n))
+        self.badge.setVisible(self._show_badge and n > 0)
+
+    def set_selected(self, sel):
+        if self.property("selected") != sel:
+            self.setProperty("selected", sel)
+            self.style().unpolish(self)
+            self.style().polish(self)
+            self.update()
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.LeftButton:
+            self.clicked.emit(self.key)
+        super().mousePressEvent(ev)
+
+
+class DownloadCard(QFrame):
+    """Rich download card: badge, name, meta, segment bar, status, actions."""
+
+    clicked = Signal(object)
+    doubleClicked = Signal(object)
+    contextRequested = Signal(object, object)
+    actionRequested = Signal(object, str)
+
+    def __init__(self, job, parent=None):
+        super().__init__(parent)
+        self.job = job
+        self.setObjectName("Card")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setProperty("selected", False)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(10)
+
+        top = QHBoxLayout()
+        top.setSpacing(12)
+        self.badge = FileBadge()
+        top.addWidget(self.badge)
+
+        mid = QVBoxLayout()
+        mid.setSpacing(3)
+        self.name_lbl = QLabel()
+        self.name_lbl.setObjectName("CardName")
+        self.meta_lbl = QLabel()
+        self.meta_lbl.setObjectName("CardMeta")
+        mid.addWidget(self.name_lbl)
+        mid.addWidget(self.meta_lbl)
+        top.addLayout(mid, 1)
+
+        self.pill = StatusPill()
+        top.addWidget(self.pill, 0, Qt.AlignTop)
+        lay.addLayout(top)
+
+        self.bar = SegmentBar()
+        lay.addWidget(self.bar)
+
+        foot = QHBoxLayout()
+        foot.setSpacing(2)
+        self.info_lbl = QLabel()
+        self.info_lbl.setObjectName("CardInfo")
+        foot.addWidget(self.info_lbl)
+        foot.addStretch(1)
+
+        self.act_toggle = QToolButton()
+        self.act_toggle.setObjectName("CardAction")
+        self.act_toggle.setCursor(Qt.PointingHandCursor)
+        self.act_toggle.clicked.connect(lambda: self.actionRequested.emit(self.job, "toggle"))
+        foot.addWidget(self.act_toggle)
+
+        self.act_folder = QToolButton()
+        self.act_folder.setObjectName("CardAction")
+        self.act_folder.setCursor(Qt.PointingHandCursor)
+        self.act_folder.setIcon(make_icon("folder", "#94a3b8", 16))
+        self.act_folder.setToolTip("Open containing folder")
+        self.act_folder.clicked.connect(lambda: self.actionRequested.emit(self.job, "folder"))
+        foot.addWidget(self.act_folder)
+
+        self.act_cancel = QToolButton()
+        self.act_cancel.setObjectName("CardAction")
+        self.act_cancel.setCursor(Qt.PointingHandCursor)
+        self.act_cancel.setIcon(make_icon("delete", "#94a3b8", 16))
+        self.act_cancel.setToolTip("Cancel / remove")
+        self.act_cancel.clicked.connect(lambda: self.actionRequested.emit(self.job, "cancel"))
+        foot.addWidget(self.act_cancel)
+
+        lay.addLayout(foot)
+        self.refresh(job)
+
+    def set_selected(self, sel):
+        if self.property("selected") != sel:
+            self.setProperty("selected", sel)
+            self.style().unpolish(self)
+            self.style().polish(self)
+            self.update()
+
+    def refresh(self, job):
+        self.job = job
+        fm = QFontMetrics(self.name_lbl.font())
+        self.name_lbl.setText(fm.elidedText(job.filename, Qt.ElideRight, 250))
+        self.name_lbl.setToolTip(job.filename)
+        state = (job.state or "").lower()
+        self.badge.set_file(job.filename, job.category)
+        self.pill.set_status(state)
+        self.bar.set_job(job)
+
+        total = job.total or 0
+        done = min(job.done or 0, total) if total else 0
+        pct = int(round(100.0 * done / total)) if total else 0
+        size_s = _fmt_size(total)
+        toggle_enabled = True
+
+        if state == "downloading":
+            speed = job.speed_avg or 0
+            self.meta_lbl.setText(f"{size_s}  •  {_fmt_size(speed)}/s" if speed else size_s)
+            eta = _fmt_eta((total - done) / speed) if speed and total else ""
+            self.info_lbl.setText(f"{pct}%" + (f"  •  {eta}" if eta else ""))
+            self.act_toggle.setIcon(make_icon("pause", "#f59e0b", 16))
+            self.act_toggle.setToolTip("Pause")
+        elif state == "paused":
+            self.meta_lbl.setText(size_s)
+            self.info_lbl.setText(f"{pct}%  •  Paused")
+            self.act_toggle.setIcon(make_icon("play", "#22c55e", 16))
+            self.act_toggle.setToolTip("Resume")
+        elif state == "error":
+            self.meta_lbl.setText(size_s)
+            self.info_lbl.setText(f"{pct}%  •  Error — right-click for options")
+            self.act_toggle.setIcon(make_icon("play", "#22c55e", 16))
+            self.act_toggle.setToolTip("Retry")
+        elif state == "queued":
+            self.meta_lbl.setText(size_s)
+            self.info_lbl.setText("Waiting in queue")
+            self.act_toggle.setIcon(make_icon("play", "#22c55e", 16))
+            self.act_toggle.setToolTip("Start now")
+        elif state == "completed":
+            self.meta_lbl.setText(size_s)
+            verified = "  •  Verified" if getattr(job, "sha256", "") else ""
+            self.info_lbl.setText(f"100%{verified}")
+            self.act_toggle.setIcon(make_icon("play", "#475569", 16))
+            toggle_enabled = False
+        else:  # canceled and anything else terminal
+            self.meta_lbl.setText(size_s)
+            self.info_lbl.setText(f"{pct}%  •  Canceled")
+            self.act_toggle.setIcon(make_icon("play", "#475569", 16))
+            toggle_enabled = False
+        self.act_toggle.setEnabled(toggle_enabled)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.LeftButton:
+            self.clicked.emit(self.job)
+        super().mousePressEvent(ev)
+
+    def mouseDoubleClickEvent(self, ev):
+        if ev.button() == Qt.LeftButton:
+            self.doubleClicked.emit(self.job)
+        super().mouseDoubleClickEvent(ev)
+
+    def contextMenuEvent(self, ev):
+        self.contextRequested.emit(self.job, ev.globalPos())
+
+
+# -----------------------------------------------------------------------------
 # Main Application Window (Fluent / Clean Modern Layout)
 # -----------------------------------------------------------------------------
 class MainWindow(QMainWindow):
@@ -452,7 +830,10 @@ class MainWindow(QMainWindow):
         self._start_embedded_daemon()
 
         self.selected_category = "All"
-        self._items_by_id = {}
+        self._cards_by_id = {}
+        self._selected_id = None
+        self._last_layout_ids = None
+        self._speed_limit_mb = 0
 
         self._build_ui()
         self._setup_system_tray()
@@ -542,181 +923,237 @@ class MainWindow(QMainWindow):
             self.refresh_rows()
 
     def _build_ui(self):
+        from . import __version__
         central = QWidget()
         self.setCentralWidget(central)
         root_lay = QVBoxLayout(central)
         root_lay.setContentsMargins(0, 0, 0, 0)
         root_lay.setSpacing(0)
 
-        # 1. Header Toolbar
-        toolbar = QWidget()
-        toolbar.setObjectName("TopToolbar")
-        t_lay = QHBoxLayout(toolbar)
-        t_lay.setContentsMargins(14, 10, 14, 10)
-        t_lay.setSpacing(8)
+        # ---- top bar ------------------------------------------------------
+        topbar = QWidget()
+        topbar.setObjectName("TopBar")
+        t = QHBoxLayout(topbar)
+        t.setContentsMargins(16, 10, 16, 10)
+        t.setSpacing(10)
 
-        # App Brand
-        brand = QLabel(" OpenDM")
-        brand.setStyleSheet("font-size: 16px; font-weight: 800; color: #38bdf8; margin-right: 12px;")
-        t_lay.addWidget(brand)
+        brand_icon = QLabel()
+        brand_icon.setPixmap(make_icon("app", "#3b82f6", 28).pixmap(28, 28))
+        t.addWidget(brand_icon)
+        brand = QLabel("OpenDM")
+        brand.setObjectName("Brand")
+        t.addWidget(brand)
+        ver = QLabel(f"v{__version__}")
+        ver.setObjectName("VersionTag")
+        t.addWidget(ver)
+        t.addSpacing(10)
 
-        # Actions
-        self.btn_add = QPushButton(" Add URL")
-        self.btn_add.setIcon(make_icon("add", "#ffffff"))
-        self.btn_add.setStyleSheet("""
-            QPushButton {
-                background: #2563eb; color: white; font-weight: bold;
-                border: none; padding: 7px 16px; border-radius: 6px;
-            }
-            QPushButton:hover { background: #1d4ed8; }
-        """)
-        self.btn_add.clicked.connect(self.add_url)
-        t_lay.addWidget(self.btn_add)
+        self.search_box = QLineEdit()
+        self.search_box.setObjectName("SearchBox")
+        self.search_box.setPlaceholderText("Search downloads…")
+        self.search_box.setClearButtonEnabled(True)
+        self.search_box.setFixedWidth(230)
+        self.search_box.addAction(make_icon("search", "#64748b", 14),
+                                  QLineEdit.LeadingPosition)
+        self.search_box.textChanged.connect(self._on_search_changed)
+        t.addWidget(self.search_box)
 
-        self.btn_start = QPushButton(" Resume")
-        self.btn_start.setIcon(make_icon("play", "#22c55e"))
-        self.btn_start.clicked.connect(self.resume_selected)
-        t_lay.addWidget(self.btn_start)
+        t.addStretch(1)
 
-        self.btn_pause = QPushButton(" Pause")
-        self.btn_pause.setIcon(make_icon("pause", "#f59e0b"))
-        self.btn_pause.clicked.connect(self.pause_selected)
-        t_lay.addWidget(self.btn_pause)
-
-        self.btn_cancel = QPushButton(" Cancel")
-        self.btn_cancel.setIcon(make_icon("delete", "#ef4444"))
-        self.btn_cancel.clicked.connect(self.cancel_selected)
-        t_lay.addWidget(self.btn_cancel)
-
-        self.btn_details = QPushButton(" Details")
-        self.btn_details.setIcon(make_icon("info", "#94a3b8"))
-        self.btn_details.clicked.connect(self.details_selected)
-        t_lay.addWidget(self.btn_details)
-
-        self.btn_open_folder = QPushButton(" Open Folder")
-        self.btn_open_folder.setIcon(make_icon("folder", "#94a3b8"))
-        self.btn_open_folder.clicked.connect(self.open_downloads_folder)
-        t_lay.addWidget(self.btn_open_folder)
-
-        self.btn_settings = QPushButton(" Settings")
-        self.btn_settings.setIcon(make_icon("settings", "#94a3b8"))
-        self.btn_settings.clicked.connect(self.open_settings)
-        t_lay.addWidget(self.btn_settings)
-
-        self.btn_update = QPushButton(" Updates")
-        self.btn_update.setIcon(make_icon("app", "#38bdf8"))
-        self.btn_update.clicked.connect(lambda: self.check_updates_gui(manual=True))
-        t_lay.addWidget(self.btn_update)
-
-        t_lay.addSpacing(16)
-        t_lay.addWidget(QLabel("Speed Limit:"))
-        self.speed_slider = QSlider(Qt.Horizontal)
-        self.speed_slider.setRange(0, 100)  # 0 = Unlimited, 100 = 100 MB/s
-        self.speed_slider.setValue(0)
-        self.speed_slider.setFixedWidth(120)
+        self.speed_pill = ClickableFrame()
+        self.speed_pill.setObjectName("SpeedPill")
+        self.speed_pill.setCursor(Qt.PointingHandCursor)
+        self.speed_pill.setToolTip("Download speed limit — click to change")
+        pill_lay = QHBoxLayout(self.speed_pill)
+        pill_lay.setContentsMargins(12, 0, 12, 0)
+        pill_lay.setSpacing(7)
+        gauge = QLabel()
+        gauge.setPixmap(make_icon("gauge", "#38bdf8", 14).pixmap(14, 14))
+        pill_lay.addWidget(gauge)
         self.speed_slider_lbl = QLabel("Unlimited")
-        self.speed_slider_lbl.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: bold; min-width: 65px;")
-        self.speed_slider.valueChanged.connect(self._on_speed_slider_changed)
-        t_lay.addWidget(self.speed_slider)
-        t_lay.addWidget(self.speed_slider_lbl)
+        self.speed_slider_lbl.setObjectName("SpeedPillLabel")
+        pill_lay.addWidget(self.speed_slider_lbl)
+        self.speed_pill.clicked.connect(self._open_speed_popover)
+        t.addWidget(self.speed_pill)
 
-        t_lay.addStretch()
-        root_lay.addWidget(toolbar)
+        self.btn_pause_all = QPushButton("Pause All")
+        self.btn_pause_all.setIcon(make_icon("pause", "#f59e0b", 16))
+        self.btn_pause_all.setObjectName("GhostBtn")
+        self.btn_pause_all.setCursor(Qt.PointingHandCursor)
+        self.btn_pause_all.clicked.connect(self.pause_all)
+        t.addWidget(self.btn_pause_all)
 
-        # 2. Main Content Splitter (Sidebar + Downloads List)
+        self.btn_add = QPushButton("New Download")
+        self.btn_add.setIcon(make_icon("add", "#ffffff", 16))
+        self.btn_add.setObjectName("PrimaryBtn")
+        self.btn_add.setCursor(Qt.PointingHandCursor)
+        self.btn_add.clicked.connect(self.add_url)
+        t.addWidget(self.btn_add)
+
+        self.btn_gear = QToolButton()
+        self.btn_gear.setObjectName("IconBtn")
+        self.btn_gear.setIcon(make_icon("gear", "#94a3b8", 18))
+        self.btn_gear.setCursor(Qt.PointingHandCursor)
+        self.btn_gear.setToolTip("Menu")
+        self.btn_gear.clicked.connect(self._open_gear_menu)
+        t.addWidget(self.btn_gear)
+
+        root_lay.addWidget(topbar)
+
+        # ---- body: sidebar + main ------------------------------------------
         splitter = QSplitter(Qt.Horizontal)
         splitter.setHandleWidth(1)
 
-        # Left Sidebar (Categories)
-        sidebar = QWidget()
-        sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(200)
-        s_lay = QVBoxLayout(sidebar)
-        s_lay.setContentsMargins(12, 16, 12, 16)
-        s_lay.setSpacing(4)
+        side = QWidget()
+        side.setObjectName("SideNav")
+        side.setFixedWidth(224)
+        s = QVBoxLayout(side)
+        s.setContentsMargins(14, 16, 14, 16)
+        s.setSpacing(2)
 
-        cat_title = QLabel("CATEGORIES")
-        cat_title.setStyleSheet("font-size: 11px; font-weight: bold; color: #64748b; margin-bottom: 8px;")
-        s_lay.addWidget(cat_title)
+        lib_lbl = QLabel("LIBRARY")
+        lib_lbl.setObjectName("SectionLabel")
+        s.addWidget(lib_lbl)
+        self.nav_items = {}
+        for key, label, icon, color in LIBRARY_ITEMS:
+            item = NavItem(key, label, icon=icon, color=color)
+            item.clicked.connect(self.set_category)
+            s.addWidget(item)
+            self.nav_items[key] = item
+        s.addSpacing(10)
 
-        self.cat_buttons = {}
-        cats = [
-            ("All", "All Downloads"),
-            ("Downloading", "Downloading"),
-            ("Completed", "Completed"),
-            ("Paused", "Paused"),
-            ("Compressed", "Compressed (Zip/Rar)"),
-            ("Video", "Video & Media"),
-            ("Documents", "Documents"),
-            ("Programs", "Applications"),
-        ]
-        for key, title in cats:
-            btn = QPushButton(f"  {title}")
-            btn.setObjectName("CategoryBtn")
-            btn.setCheckable(True)
-            btn.clicked.connect(lambda ch, k=key: self.set_category(k))
-            s_lay.addWidget(btn)
-            self.cat_buttons[key] = btn
+        cat_lbl = QLabel("CATEGORIES")
+        cat_lbl.setObjectName("SectionLabel")
+        s.addWidget(cat_lbl)
+        for key in ("Compressed", "Video", "Music", "Documents", "Programs"):
+            label, color = CATEGORY_META[key]
+            item = NavItem(key, label, icon=None, color=color)
+            item.clicked.connect(self.set_category)
+            s.addWidget(item)
+            self.nav_items[key] = item
 
-        self.cat_buttons["All"].setChecked(True)
-        s_lay.addStretch()
-        splitter.addWidget(sidebar)
+        s.addStretch(1)
+        nav_settings = NavItem("settings", "Settings", icon="gear", color="#94a3b8",
+                               show_badge=False)
+        nav_settings.clicked.connect(lambda _k: self.open_settings())
+        s.addWidget(nav_settings)
+        nav_help = NavItem("help", "Help", icon="info", color="#94a3b8",
+                           show_badge=False)
+        nav_help.clicked.connect(lambda _k: self._show_help())
+        s.addWidget(nav_help)
 
-        # Right Area (Table)
-        right_container = QWidget()
-        r_lay = QVBoxLayout(right_container)
-        r_lay.setContentsMargins(0, 0, 0, 0)
-        r_lay.setSpacing(0)
+        self.nav_items["All"].set_selected(True)
+        splitter.addWidget(side)
 
-        self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["File Name", "Size", "Progress", "Speed", "Status", "Category", "Verification"])
-        self.tree.header().setSectionResizeMode(0, QHeaderView.Interactive)
-        self.tree.setColumnWidth(0, 280)
-        self.tree.setColumnWidth(1, 95)
-        self.tree.setColumnWidth(2, 220)
-        self.tree.setColumnWidth(3, 110)
-        self.tree.setColumnWidth(4, 105)
-        self.tree.setColumnWidth(5, 95)
-        self.tree.setColumnWidth(6, 140)
-        self.tree.setSelectionMode(QTreeWidget.SingleSelection)
-        self.tree.setSelectionBehavior(QTreeWidget.SelectRows)
-        self.tree.setRootIsDecorated(False)
-        self.tree.setAlternatingRowColors(True)
-        self.tree.setItemDelegateForColumn(2, ModernProgressDelegate(self.tree))
-        self.tree.itemDoubleClicked.connect(self.details_item)
-        self.tree.itemSelectionChanged.connect(self._update_actions_state)
-        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.tree.customContextMenuRequested.connect(self._show_context_menu)
+        # ---- main ------------------------------------------------------------
+        main = QWidget()
+        m = QVBoxLayout(main)
+        m.setContentsMargins(22, 18, 22, 0)
+        m.setSpacing(12)
 
-        r_lay.addWidget(self.tree)
-        splitter.addWidget(right_container)
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        title = QLabel("Downloads")
+        title.setObjectName("PageTitle")
+        head.addWidget(title)
+        self.subtitle_lbl = QLabel("")
+        self.subtitle_lbl.setObjectName("Subtitle")
+        head.addWidget(self.subtitle_lbl, 0, Qt.AlignBottom)
+        head.addStretch(1)
+        sort_lbl = QLabel("Sort:")
+        sort_lbl.setObjectName("Subtitle")
+        head.addWidget(sort_lbl)
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItem("Newest", "newest")
+        self.sort_combo.addItem("Name", "name")
+        self.sort_combo.addItem("Size", "size")
+        self.sort_combo.addItem("Progress", "progress")
+        self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
+        head.addWidget(self.sort_combo)
+        m.addLayout(head)
 
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.NoFrame)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        cards_host = QWidget()
+        self.cards_grid = QGridLayout(cards_host)
+        self.cards_grid.setContentsMargins(2, 2, 2, 18)
+        self.cards_grid.setSpacing(14)
+        self.cards_grid.setColumnStretch(0, 1)
+        self.cards_grid.setColumnStretch(1, 1)
+        self.scroll_area.setWidget(cards_host)
+        self.scroll_area.viewport().setStyleSheet("background: #0b0f19;")
+        m.addWidget(self.scroll_area, 1)
+
+        self.empty_widget = QWidget()
+        e = QVBoxLayout(self.empty_widget)
+        e.setAlignment(Qt.AlignCenter)
+        e.setSpacing(10)
+        e_icon = QLabel()
+        e_icon.setPixmap(make_icon("app", "#3b82f6").pixmap(24, 24).scaled(
+            72, 72, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        e_icon.setAlignment(Qt.AlignCenter)
+        e.addWidget(e_icon)
+        e_title = QLabel("No downloads yet")
+        e_title.setObjectName("EmptyTitle")
+        e_title.setAlignment(Qt.AlignCenter)
+        e.addWidget(e_title)
+        e_hint = QLabel("Click New Download or paste a download link to get started.")
+        e_hint.setObjectName("EmptyHint")
+        e_hint.setAlignment(Qt.AlignCenter)
+        e_hint.setWordWrap(True)
+        e.addWidget(e_hint)
+        e.addSpacing(6)
+        e_btn = QPushButton("New Download")
+        e_btn.setIcon(make_icon("add", "#ffffff", 16))
+        e_btn.setObjectName("PrimaryBtn")
+        e_btn.setCursor(Qt.PointingHandCursor)
+        e_btn.clicked.connect(self.add_url)
+        e_btn_row = QHBoxLayout()
+        e_btn_row.addStretch(1)
+        e_btn_row.addWidget(e_btn)
+        e_btn_row.addStretch(1)
+        e.addLayout(e_btn_row)
+        m.addWidget(self.empty_widget, 1)
+        self.empty_widget.setVisible(False)
+
+        splitter.addWidget(main)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         root_lay.addWidget(splitter, 1)
 
-        # 3. Modern Status Bar
+        # ---- status bar --------------------------------------------------------
         self.status_bar = QStatusBar()
         self.stat_label = QLabel("Ready • Engine Online")
-        self.stat_label.setStyleSheet("color: #94a3b8; font-size: 12px; margin-left: 8px;")
-        self.status_bar.addWidget(self.stat_label)
+        self.stat_label.setObjectName("StatusMain")
+        self.status_bar.addWidget(self.stat_label, 1)
+        self.free_label = QLabel("")
+        self.free_label.setObjectName("StatusDim")
+        self.status_bar.addPermanentWidget(self.free_label)
+        dot = QLabel()
+        dot.setFixedSize(8, 8)
+        dot.setStyleSheet("background: #22c55e; border-radius: 4px;")
+        self.status_bar.addPermanentWidget(dot)
+        eng = QLabel("Engine Online")
+        eng.setObjectName("StatusDim")
+        self.status_bar.addPermanentWidget(eng)
         self.setStatusBar(self.status_bar)
 
+        self.refresh_rows()
+
     def set_category(self, key: str):
+        if key not in self.nav_items:
+            return
         self.selected_category = key
-        for k, btn in self.cat_buttons.items():
-            btn.setChecked(k == key)
+        for k, item in self.nav_items.items():
+            item.set_selected(k == key)
         self.refresh_rows(force_refilter=True)
 
-    def _show_context_menu(self, pos):
-        it = self.tree.itemAt(pos)
-        if not it:
-            return
-        job = it.data(0, Qt.UserRole)
-        if not job:
-            return
 
+    def _show_context_menu(self, job, global_pos):
         menu = QMenu(self)
+
         act_details = menu.addAction("Inspect Details…")
         act_details.triggered.connect(lambda: DetailsDialog(job, self).exec())
 
@@ -740,7 +1177,8 @@ class MainWindow(QMainWindow):
             act_open = menu.addAction("Open Downloaded File")
             act_open.triggered.connect(lambda: self._open_file(job.dest))
 
-        menu.exec(self.tree.viewport().mapToGlobal(pos))
+        menu.exec(global_pos)
+
 
     def _open_file(self, path: str):
         try:
@@ -792,6 +1230,7 @@ class MainWindow(QMainWindow):
                 )
 
     def _on_speed_slider_changed(self, val: int):
+        self._speed_limit_mb = val
         if val == 0:
             self.speed_slider_lbl.setText("Unlimited")
             limit_bytes = 0
@@ -801,6 +1240,7 @@ class MainWindow(QMainWindow):
         # Wire straight into the QueueManager's shared token bucket so the
         # limit applies live to every job (0 = unlimited).
         self.qm.set_speed_limit(limit_bytes)
+
 
     def open_settings(self):
         """Proxy configuration dialog (HTTP / SOCKS5)."""
@@ -1028,23 +1468,18 @@ class MainWindow(QMainWindow):
             self.refresh_rows()
 
     def _selected_job(self):
-        items = self.tree.selectedItems()
-        it = items[0] if items else self.tree.currentItem()
-        if not it:
+        if not self._selected_id:
             return None
-        return it.data(0, Qt.UserRole) or it.data(2, Qt.UserRole)
+        for j in self.qm.jobs:
+            if j.id == self._selected_id:
+                return j
+        return None
 
     def _update_actions_state(self):
-        j = self._selected_job()
-        has_sel = j is not None
-        self.btn_details.setEnabled(has_sel)
-        self.btn_cancel.setEnabled(has_sel)
-        if has_sel:
-            self.btn_pause.setEnabled(j.state == "downloading")
-            self.btn_start.setEnabled(j.state in ("paused", "error", "queued"))
-        else:
-            self.btn_pause.setEnabled(True)
-            self.btn_start.setEnabled(True)
+        self.btn_pause_all.setEnabled(
+            any(j.state == "downloading" for j in self.qm.jobs)
+        )
+
 
     def pause_selected(self):
         j = self._selected_job()
@@ -1072,75 +1507,201 @@ class MainWindow(QMainWindow):
         if j:
             DetailsDialog(j, self).exec()
 
-    def details_item(self, item, _col):
-        j = item.data(0, Qt.UserRole) or item.data(2, Qt.UserRole)
-        if j:
-            DetailsDialog(j, self).exec()
+    def _on_card_clicked(self, job):
+        self._selected_id = job.id
+        for jid, card in self._cards_by_id.items():
+            card.set_selected(jid == job.id)
+        self._update_actions_state()
+
+    def _on_card_double_clicked(self, job):
+        self._on_card_clicked(job)
+        DetailsDialog(job, self).exec()
+
+    def _on_card_context(self, job, global_pos):
+        self._on_card_clicked(job)
+        self._show_context_menu(job, global_pos)
+
+    def _on_card_action(self, job, action):
+        if action == "toggle":
+            if job.state == "downloading":
+                job.pause()
+            elif job.state in ("paused", "error", "queued"):
+                job.resume()
+        elif action == "folder":
+            self._open_file(os.path.dirname(job.dest) if job.dest else self.qm.dest_dir)
+        elif action == "cancel":
+            job.cancel()
+        self.refresh_rows()
+        self._update_actions_state()
+
+    def _on_search_changed(self, _text):
+        self.refresh_rows(force_refilter=True)
+
+    def _on_sort_changed(self, _index):
+        self.refresh_rows()
+
+    def pause_all(self):
+        for j in list(self.qm.jobs):
+            if j.state == "downloading":
+                j.pause()
+        self.refresh_rows()
+        self._update_actions_state()
+
+    def _open_speed_popover(self):
+        pop = QDialog(self, Qt.Popup)
+        pop.setWindowTitle("Speed Limit")
+        lay = QVBoxLayout(pop)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(10)
+        lay.addWidget(QLabel("Download speed limit:"))
+        chips = QHBoxLayout()
+        chips.setSpacing(6)
+        for label, mb in (("Unlimited", 0), ("1 MB/s", 1), ("5 MB/s", 5), ("20 MB/s", 20)):
+            b = QPushButton(label)
+            b.setObjectName("ChipBtn")
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(
+                lambda _c, v=mb: (self._on_speed_slider_changed(v), pop.accept())
+            )
+            chips.addWidget(b)
+        lay.addLayout(chips)
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(0, 100)
+        slider.setValue(self._speed_limit_mb)
+        slider.valueChanged.connect(self._on_speed_slider_changed)
+        lay.addWidget(slider)
+        hint = QLabel("0 = unlimited, up to 100 MB/s — applies instantly to all downloads.")
+        hint.setObjectName("Subtitle")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        pop.move(self.speed_pill.mapToGlobal(QPoint(0, self.speed_pill.height() + 6)))
+        pop.exec()
+
+    def _open_gear_menu(self):
+        menu = QMenu(self)
+        act_settings = menu.addAction("Network && Proxy Settings…")
+        act_settings.triggered.connect(self.open_settings)
+        act_update = menu.addAction("Check for Updates")
+        act_update.triggered.connect(lambda: self.check_updates_gui(manual=True))
+        menu.addSeparator()
+        act_about = menu.addAction("About OpenDM")
+        act_about.triggered.connect(self._show_help)
+        menu.exec(self.btn_gear.mapToGlobal(QPoint(0, self.btn_gear.height())))
+
+    def _show_help(self):
+        from . import __version__
+        QMessageBox.about(
+            self, "About OpenDM",
+            f"<b>OpenDM v{__version__}</b><br><br>"
+            "Advanced download manager with multi-connection segmented downloads, "
+            "browser integration and automatic updates.<br><br>"
+            "Repository: github.com/shadowcerdic/OpenDM",
+        )
+
 
     def refresh_rows(self, force_refilter=False):
         jobs = list(self.qm.jobs)
-        mb = 1024 * 1024
 
-        current_job = self._selected_job()
-        selected_id = current_job.id if current_job else None
-
-        cat = self.selected_category
-        filtered_jobs = []
+        counts = {"All": len(jobs), "Active": 0, "Completed": 0, "Queued": 0,
+                  "Compressed": 0, "Video": 0, "Music": 0, "Documents": 0, "Programs": 0}
         for j in jobs:
-            if cat == "All":
-                filtered_jobs.append(j)
-            elif cat in ("Downloading", "Completed", "Paused"):
-                if j.state.lower() == cat.lower():
-                    filtered_jobs.append(j)
-            elif j.category == cat:
-                filtered_jobs.append(j)
+            st = (j.state or "").lower()
+            if st == "downloading":
+                counts["Active"] += 1
+            elif st == "completed":
+                counts["Completed"] += 1
+            elif st == "queued":
+                counts["Queued"] += 1
+            if j.category in counts:
+                counts[j.category] += 1
+        for key, item in self.nav_items.items():
+            if key in counts:
+                item.set_count(counts[key])
 
-        seen_ids = set()
-        for j in filtered_jobs:
-            seen_ids.add(j.id)
-            it = self._items_by_id.get(j.id)
-            status_text = j.state.capitalize()
+        q = self.search_box.text().strip().lower()
+        cat = self.selected_category
+        filtered = []
+        for j in jobs:
+            st = (j.state or "").lower()
+            if cat == "Active":
+                if st != "downloading":
+                    continue
+            elif cat == "Completed":
+                if st != "completed":
+                    continue
+            elif cat == "Queued":
+                if st != "queued":
+                    continue
+            elif cat != "All" and j.category != cat:
+                continue
+            if q and q not in j.filename.lower() and q not in (j.url or "").lower():
+                continue
+            filtered.append(j)
 
-            if not it:
-                it = QTreeWidgetItem([
-                    j.filename,
-                    f"{j.total / mb:.1f} MB" if j.total else "—",
-                    "",
-                    f"{j.speed_avg / mb:.2f} MB/s" if j.state == "downloading" else "—",
-                    status_text,
-                    j.category,
-                    j.sha256[:10] + "…" if j.sha256 else "—",
-                ])
-                it.setData(0, Qt.UserRole, j)
-                it.setData(2, Qt.UserRole, j)
-                self.tree.addTopLevelItem(it)
-                self._items_by_id[j.id] = it
+        mode = self.sort_combo.currentData()
+        if mode == "name":
+            filtered.sort(key=lambda j: j.filename.lower())
+        elif mode == "size":
+            filtered.sort(key=lambda j: j.total or 0, reverse=True)
+        elif mode == "progress":
+            filtered.sort(
+                key=lambda j: (j.done / j.total) if j.total else 0, reverse=True
+            )
+
+        seen = set()
+        for j in filtered:
+            seen.add(j.id)
+            card = self._cards_by_id.get(j.id)
+            if card is None:
+                card = DownloadCard(j)
+                card.clicked.connect(self._on_card_clicked)
+                card.doubleClicked.connect(self._on_card_double_clicked)
+                card.contextRequested.connect(self._on_card_context)
+                card.actionRequested.connect(self._on_card_action)
+                card.set_selected(j.id == self._selected_id)
+                self._cards_by_id[j.id] = card
             else:
-                it.setText(0, j.filename)
-                it.setText(1, f"{j.total / mb:.1f} MB" if j.total else "—")
-                it.setText(3, f"{j.speed_avg / mb:.2f} MB/s" if j.state == "downloading" else "—")
-                it.setText(4, status_text)
-                it.setText(5, j.category)
-                it.setText(6, j.sha256[:10] + "…" if j.sha256 else "—")
-                it.setData(0, Qt.UserRole, j)
-                it.setData(2, Qt.UserRole, j)
+                card.refresh(j)
+        for jid in list(self._cards_by_id.keys()):
+            if jid not in seen:
+                card = self._cards_by_id.pop(jid)
+                self.cards_grid.removeWidget(card)
+                card.setParent(None)
+                card.deleteLater()
+                if self._selected_id == jid:
+                    self._selected_id = None
 
-        for jid in list(self._items_by_id.keys()):
-            if jid not in seen_ids:
-                it = self._items_by_id.pop(jid)
-                idx = self.tree.indexOfTopLevelItem(it)
-                if idx >= 0:
-                    self.tree.takeTopLevelItem(idx)
+        layout_ids = [j.id for j in filtered]
+        if layout_ids != self._last_layout_ids:
+            for r in range(self.cards_grid.rowCount()):
+                self.cards_grid.setRowStretch(r, 0)
+            while self.cards_grid.count():
+                self.cards_grid.takeAt(0)
+            for i, j in enumerate(filtered):
+                self.cards_grid.addWidget(self._cards_by_id[j.id], i // 2, i % 2)
+            # Empty trailing row absorbs leftover vertical space so cards keep
+            # their natural height instead of stretching to fill the viewport.
+            self.cards_grid.setRowStretch((len(filtered) + 1) // 2, 1)
+            self._last_layout_ids = layout_ids
 
-        if selected_id and selected_id in self._items_by_id:
-            self.tree.setCurrentItem(self._items_by_id[selected_id])
+        has = bool(filtered)
+        self.scroll_area.setVisible(has)
+        self.empty_widget.setVisible(not has)
+        self.subtitle_lbl.setText(f"Showing {len(filtered)} of {len(jobs)}")
 
-        active = sum(1 for j in jobs if j.state == "downloading")
-        done = sum(1 for j in jobs if j.state == "completed")
-        self.stat_label.setText(f"Total: {len(jobs)}  •  Active: {active}  •  Completed: {done}  •  Directory: {self.qm.dest_dir}")
+        self.stat_label.setText(
+            f"Total: {len(jobs)}  •  Active: {counts['Active']}  •  "
+            f"Completed: {counts['Completed']}  •  Directory: {self.qm.dest_dir}"
+        )
+        try:
+            free = shutil.disk_usage(self.qm.dest_dir).free
+            self.free_label.setText(f"Free space: {_fmt_size(free)}")
+        except OSError:
+            self.free_label.setText("")
+        self._update_actions_state()
 
 
-# -----------------------------------------------------------------------------
+
 # Premium Dark Theme Stylesheet (Modern Fluent Slate)
 # -----------------------------------------------------------------------------
 MODERN_THEME = """
@@ -1254,6 +1815,216 @@ QLineEdit, QSpinBox {
 }
 QLineEdit:focus, QSpinBox:focus {
     border: 1px solid #3b82f6;
+}
+/* ---- Card-layout redesign additions ---- */
+#TopBar {
+    background-color: #0f172a;
+    border-bottom: 1px solid #1e293b;
+}
+#Brand {
+    font-size: 17px;
+    font-weight: 800;
+    color: #f8fafc;
+}
+#VersionTag {
+    font-size: 11px;
+    color: #64748b;
+    background: #1e293b;
+    border-radius: 8px;
+    padding: 2px 8px;
+}
+#SearchBox {
+    background-color: #1a2334;
+    border: 1px solid #243049;
+    border-radius: 8px;
+    padding: 7px 12px;
+    color: #e2e8f0;
+}
+#SearchBox:focus {
+    border: 1px solid #3b82f6;
+}
+#SpeedPill {
+    background-color: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 14px;
+    padding: 6px 4px;
+    color: #e2e8f0;
+}
+#SpeedPill:hover {
+    border: 1px solid #3b82f6;
+}
+#SpeedPillLabel {
+    color: #38bdf8;
+    font-weight: 600;
+    font-size: 12px;
+    background: transparent;
+    border: none;
+}
+#GhostBtn {
+    background: transparent;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    padding: 7px 14px;
+    color: #e2e8f0;
+}
+#GhostBtn:hover {
+    border-color: #f59e0b;
+}
+#GhostBtn:disabled {
+    color: #475569;
+    border-color: #1e293b;
+}
+#PrimaryBtn {
+    background: #2563eb;
+    border: none;
+    border-radius: 8px;
+    padding: 8px 18px;
+    color: white;
+    font-weight: 700;
+}
+#PrimaryBtn:hover {
+    background: #1d4ed8;
+}
+#IconBtn {
+    background: transparent;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    padding: 7px;
+}
+#IconBtn:hover {
+    border-color: #3b82f6;
+}
+#SideNav {
+    background-color: #0d1322;
+    border-right: 1px solid #1e293b;
+}
+#SectionLabel {
+    font-size: 11px;
+    font-weight: 700;
+    color: #64748b;
+    padding: 0 10px 6px 10px;
+}
+#NavItem {
+    border-radius: 8px;
+}
+#NavItem:hover {
+    background: #162032;
+}
+#NavItem[selected="true"] {
+    background: #1d2b4a;
+}
+#NavItem[selected="true"] QLabel {
+    color: #f8fafc;
+    font-weight: 600;
+}
+#NavBadge {
+    background: #243049;
+    color: #94a3b8;
+    border-radius: 9px;
+    padding: 1px 8px;
+    font-size: 11px;
+    font-weight: 600;
+}
+#NavItem[selected="true"] #NavBadge {
+    background: #2563eb;
+    color: white;
+}
+#PageTitle {
+    font-size: 20px;
+    font-weight: 800;
+    color: #f8fafc;
+}
+#Subtitle {
+    font-size: 12px;
+    color: #64748b;
+}
+QScrollArea {
+    background: transparent;
+    border: none;
+}
+#Card {
+    background: #111a2e;
+    border: 1px solid #1e2a44;
+    border-radius: 12px;
+}
+#Card:hover {
+    border: 1px solid #2c3d63;
+}
+#Card[selected="true"] {
+    border: 1px solid #3b82f6;
+}
+#CardName {
+    font-size: 13px;
+    font-weight: 600;
+    color: #f1f5f9;
+    background: transparent;
+    border: none;
+}
+#CardMeta {
+    font-size: 12px;
+    color: #7d8ba3;
+    background: transparent;
+    border: none;
+}
+#CardInfo {
+    font-size: 12px;
+    color: #38bdf8;
+    font-weight: 600;
+    background: transparent;
+    border: none;
+}
+#CardAction {
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    padding: 5px;
+}
+#CardAction:hover {
+    background: #1e293b;
+}
+#EmptyTitle {
+    font-size: 16px;
+    font-weight: 700;
+    color: #e2e8f0;
+}
+#EmptyHint {
+    font-size: 13px;
+    color: #64748b;
+}
+#ChipBtn {
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 12px;
+    padding: 5px 12px;
+    font-size: 12px;
+}
+#ChipBtn:hover {
+    border-color: #3b82f6;
+    color: #38bdf8;
+}
+#StatusMain {
+    color: #94a3b8;
+    font-size: 12px;
+}
+#StatusDim {
+    color: #64748b;
+    font-size: 12px;
+}
+QStatusBar {
+    background: #0d1322;
+    border-top: 1px solid #1e293b;
+}
+QComboBox {
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    padding: 5px 10px;
+    color: #e2e8f0;
+}
+QComboBox QAbstractItemView {
+    background: #1e293b;
+    color: #e2e8f0;
+    selection-background-color: #2563eb;
 }
 """
 
