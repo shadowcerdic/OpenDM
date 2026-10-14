@@ -6,6 +6,7 @@ import tempfile
 import urllib.request
 import urllib.error
 import pytest
+import sys
 
 from opendm import security
 
@@ -38,6 +39,12 @@ def test_shipped_default_origins_have_no_wildcards(tmp_path, monkeypatch):
     assert not any("*" in o for o in cfg["allowed_origins"])
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX permission bits are meaningless on Windows ACLs; "
+           "os.chmod(0o600) is a no-op there and stat reports 0o666. "
+           "The POSIX 0600 assertion below is intentionally kept strict.",
+)
 def test_token_file_permissions(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     cfg = security.load_or_create_config()
