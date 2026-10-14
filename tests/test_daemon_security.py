@@ -9,7 +9,7 @@ import urllib.error
 import pytest
 import websockets
 
-from opendm.daemon import HardenedApiHandler, HTTPServer, ws_handler, CONFIG, TOKEN
+from opendm.daemon import HardenedApiHandler, ThreadedHTTPServer, ws_handler, CONFIG, TOKEN
 
 
 @pytest.fixture(scope="module")
@@ -21,7 +21,7 @@ def daemon_server(tmp_path_factory):
     daemon.DEST_DIR = str(download_dir)
     daemon.QM = daemon.QueueManager(str(download_dir), state_file=cfg_dir / "q.json")
 
-    httpd = HTTPServer(("127.0.0.1", 0), HardenedApiHandler)
+    httpd = ThreadedHTTPServer(("127.0.0.1", 0), HardenedApiHandler)
     http_port = httpd.server_address[1]
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
