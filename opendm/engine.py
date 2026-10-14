@@ -39,6 +39,13 @@ class ProtocolViolation(Exception):
     """Raised when server violates HTTP range protocol (e.g. 200 OK on mid-file request)."""
 
 
+class ShortReadError(Exception):
+    """Raised when a response ends before the requested range is complete.
+
+    Retryable: the worker re-requests from the current cursor with backoff.
+    """
+
+
 class Segment:
     """Represents a range chunk [start, end] with dynamic cursor and boundary."""
 
@@ -311,6 +318,16 @@ def _download_single_segment(
                         f"for mid-segment request bytes={pos}-{current_end}"
                     )
 
+                # Content-Range integrity: a 206 must start where we asked.
+                if r.status == 206:
+                    cr = r.headers.get("Content-Range") or ""
+                    m = re.match(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", cr)
+                    if not m or int(m.group(1)) != pos:
+                        raise ProtocolViolation(
+                            f"Content-Range start mismatch: requested bytes={pos}-{current_end}, "
+                            f"server answered {cr!r}"
+                        )
+
                 # Resume Integrity: Check If-Range mismatch
                 if etag and r.status == 200 and pos > 0:
                     raise RemoteFileChanged("Server returned 200 on range request with If-Range; file changed.")
@@ -332,6 +349,16 @@ def _download_single_segment(
                     chunk_limit = min(65536, current_end - curr_pos + 1) if not is_full_stream else 65536
                     buf = r.read(chunk_limit)
                     if not buf:
+                        if not is_full_stream:
+                            with seg_lock:
+                                cursor_now = seg.cursor
+                                end_now = seg.end
+                            if cursor_now <= end_now:
+                                raise ShortReadError(
+                                    f"short read: connection ended after "
+                                    f"{cursor_now - pos} of {end_now - pos + 1} bytes "
+                                    f"for range bytes={pos}-{end_now}"
+                                )
                         break
 
                     # Thread-safe write to preallocated file
