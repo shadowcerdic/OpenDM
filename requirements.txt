@@ -1,0 +1,7 @@
+# Pinned CI/test dependencies (exact versions).
+# Used by .github/workflows/release.yml ("Install Test Dependencies" step)
+# and by actions/setup-python's pip cache (it requires a dependency file).
+PySide6==6.12.0
+websockets==17.2
+pytest==9.1.1
+cryptography==50.0.2
