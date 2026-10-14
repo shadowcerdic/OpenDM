@@ -9,14 +9,18 @@ Features:
 """
 from __future__ import annotations
 
+import email.utils
+import errno
 import hashlib
 import json
 import os
 import re
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from typing import Callable
 
 from .sanitize import parse_content_disposition, sanitize_filename
@@ -44,6 +48,48 @@ class ShortReadError(Exception):
 
     Retryable: the worker re-requests from the current cursor with backoff.
     """
+
+
+class _DiskError(OSError):
+    """Non-retryable disk failure from fd.seek/fd.write (ENOSPC, EACCES, ...).
+
+    Never retried: retrying a full or unwritable disk cannot succeed.
+    """
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse a Retry-After header value into seconds, or None if unusable."""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        secs = float(value)
+        return min(max(secs, 0.0), 120.0)
+    except ValueError:
+        pass
+    try:
+        dt = email.utils.parsedate_to_datetime(value)
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = (dt - datetime.now(timezone.utc)).total_seconds()
+        return min(max(delta, 0.0), 120.0)
+    except Exception:
+        return None
+
+
+def _interruptible_sleep(stop_event: threading.Event | None,
+                         abort_event: threading.Event | None,
+                         seconds: float):
+    """Sleep, raising Paused/_Aborted promptly if stop/abort is set."""
+    t_end = time.time() + max(0.0, seconds)
+    while time.time() < t_end:
+        if stop_event is not None and stop_event.is_set():
+            raise Paused()
+        if abort_event is not None and abort_event.is_set():
+            raise _Aborted()
+        time.sleep(min(0.2, t_end - time.time()))
 
 
 class Segment:
@@ -361,9 +407,20 @@ def _download_single_segment(
                                 )
                         break
 
-                    # Thread-safe write to preallocated file
-                    fd.seek(curr_pos)
-                    fd.write(buf)
+                    # Thread-safe write to preallocated file.
+                    # Disk failures (full disk, permissions) are fatal: never retry.
+                    try:
+                        fd.seek(curr_pos)
+                        fd.write(buf)
+                    except OSError as ex:
+                        if ex.errno in (errno.ENOSPC, errno.EACCES,
+                                        errno.EDQUOT, errno.EROFS):
+                            raise _DiskError(
+                                ex.errno,
+                                f"Disk write failed at offset {curr_pos}: "
+                                f"{os.strerror(ex.errno)}; download aborted"
+                            ) from ex
+                        raise
 
                     with seg_lock:
                         seg.cursor += len(buf)
@@ -376,18 +433,36 @@ def _download_single_segment(
             return
         except Paused:
             raise
+        except _DiskError:
+            raise
         except (ProtocolViolation, RemoteFileChanged):
             raise
+        except urllib.error.HTTPError as ex:
+            status = ex.code or 0
+            if 400 <= status < 500 and status not in (408, 429):
+                # Non-retryable client error: surface the HTTP status as-is.
+                raise
+            # Retryable: 408/429/5xx. Honor Retry-After for 429/503.
+            wait = None
+            if status in (429, 503):
+                wait = _parse_retry_after(
+                    ex.headers.get("Retry-After") if ex.headers else None)
+            attempt += 1
+            if attempt > max_retries or (stop_event is not None and stop_event.is_set()):
+                raise
+            _interruptible_sleep(
+                stop_event, None,
+                wait if wait is not None else min(2 ** attempt * 0.5, 5.0))
+        except OSError as ex:
+            attempt += 1
+            if attempt > max_retries or (stop_event is not None and stop_event.is_set()):
+                raise RuntimeError(f"Network error after {attempt} attempts: {ex}")
+            _interruptible_sleep(stop_event, None, min(2 ** attempt * 0.5, 5.0))
         except Exception as ex:
             attempt += 1
             if attempt > max_retries or (stop_event is not None and stop_event.is_set()):
                 raise RuntimeError(f"Network error after {attempt} attempts: {ex}")
-            backoff = min(2 ** attempt * 0.5, 5.0)
-            t_end = time.time() + backoff
-            while time.time() < t_end:
-                if stop_event is not None and stop_event.is_set():
-                    raise Paused()
-                time.sleep(0.2)
+            _interruptible_sleep(stop_event, None, min(2 ** attempt * 0.5, 5.0))
 
 
 def compute_sha256(filepath: str, total_size: int = -1) -> str:

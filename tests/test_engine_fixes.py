@@ -128,3 +128,112 @@ def test_206_content_range_start_match_ok(tmp_path):
         n = engine._fetch_chunk(server.url("/file.bin"), 0, 4095, dest)
         assert n == 4096
         assert open(dest, "rb").read() == PAYLOAD[:4096]
+# Item 2: retry policy — 4xx (except 408/429) non-retryable, Retry-After honored,
+# disk OSErrors (ENOSPC/EACCES) surface immediately
+# ---------------------------------------------------------------------------
+
+def _seg_download(url, tmp_path, name="t.bin", **kw):
+    dest = str(tmp_path / name)
+    engine.preallocate_file(dest, 4096)
+    seg = engine.Segment(0, 0, 4095)
+    lock = threading.Lock()
+    kw.setdefault("max_retries", 2)
+    with open(dest, "r+b") as fd:
+        engine._download_single_segment(
+            url=url, seg=seg, fd=fd, seg_lock=lock,
+            stop_event=None, on_bytes=None, extra_headers=None,
+            etag=None, meta_saver=None, **kw)
+    return seg
+
+
+def _get_count(server, path):
+    return sum(1 for r in server.requests
+               if r["method"] == "GET" and r["path"] == path)
+
+
+def test_403_is_not_retried_and_surfaces_status(tmp_path):
+    """403 (non-408/429 4xx) must fail fast: exactly one GET, status in error."""
+    with make_server({"paths": {"/fb": {"status": 403}}}) as server:
+        with pytest.raises(Exception, match="403"):
+            _seg_download(server.url("/fb"), tmp_path)
+        assert _get_count(server, "/fb") == 1, "403 must not be retried"
+
+
+def test_404_is_not_retried(tmp_path):
+    with make_server({"paths": {"/nf": {"status": 404}}}) as server:
+        with pytest.raises(Exception, match="404"):
+            _seg_download(server.url("/nf"), tmp_path)
+        assert _get_count(server, "/nf") == 1, "404 must not be retried"
+
+
+def test_429_honors_retry_after(tmp_path):
+    """429 is retryable and must honor the Retry-After delay."""
+    with make_server({"paths": {"/rl": {"status": 429, "retry_after": 2}}}) as server:
+        t0 = time.time()
+        with pytest.raises(Exception):
+            _seg_download(server.url("/rl"), tmp_path, max_retries=1)
+        dt = time.time() - t0
+        assert _get_count(server, "/rl") == 2, "429 must be retried once"
+        assert dt >= 2.0, f"Retry-After: 2 was not honored (waited {dt:.2f}s)"
+
+
+def test_503_honors_retry_after(tmp_path):
+    with make_server({"paths": {"/un": {"status": 503, "retry_after": 2}}}) as server:
+        t0 = time.time()
+        with pytest.raises(Exception):
+            _seg_download(server.url("/un"), tmp_path, max_retries=1)
+        dt = time.time() - t0
+        assert _get_count(server, "/un") == 2, "503 must be retried once"
+        assert dt >= 2.0, f"Retry-After: 2 was not honored (waited {dt:.2f}s)"
+
+
+def test_408_is_retryable(tmp_path):
+    with make_server({"paths": {"/to": {"status": 408}}}) as server:
+        with pytest.raises(Exception):
+            _seg_download(server.url("/to"), tmp_path, max_retries=1)
+        assert _get_count(server, "/to") == 2, "408 must be retried"
+
+
+def test_500_is_retryable(tmp_path):
+    with make_server({"paths": {"/e500": {"status": 500}}}) as server:
+        with pytest.raises(Exception):
+            _seg_download(server.url("/e500"), tmp_path, max_retries=1)
+        assert _get_count(server, "/e500") == 2, "500 must be retried"
+
+
+class _EnospcFD:
+    """File-like whose write() always fails with ENOSPC."""
+
+    def __init__(self, f):
+        self._f = f
+
+    def seek(self, p):
+        return self._f.seek(p)
+
+    def write(self, b):
+        raise OSError(28, "No space left on device")
+
+    def flush(self):
+        return self._f.flush()
+
+
+def test_enospc_write_error_is_fatal_and_not_retried(tmp_path):
+    """ENOSPC from fd.write must surface immediately (no retries)."""
+    import errno
+    with make_server({}) as server:
+        dest = str(tmp_path / "disk.bin")
+        engine.preallocate_file(dest, 4096)
+        seg = engine.Segment(0, 0, 4095)
+        lock = threading.Lock()
+        with open(dest, "r+b") as raw:
+            with pytest.raises(OSError) as excinfo:
+                engine._download_single_segment(
+                    url=server.url("/file.bin"), seg=seg, fd=_EnospcFD(raw),
+                    seg_lock=lock, stop_event=None, on_bytes=None,
+                    extra_headers=None, etag=None, meta_saver=None,
+                    max_retries=3)
+        assert excinfo.value.errno == errno.ENOSPC
+        assert _get_count(server, "/file.bin") == 1, "disk error must not be retried"
+
+
+# ---------------------------------------------------------------------------
