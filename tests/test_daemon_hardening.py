@@ -13,6 +13,7 @@ import asyncio
 import inspect
 import json
 import os
+import select
 import socket
 import threading
 import time
@@ -110,7 +111,8 @@ def _recv_all(s):
             if not chunk:
                 break
             resp += chunk
-    except (socket.timeout, ConnectionResetError, BrokenPipeError):
+    except (socket.timeout, ConnectionResetError, BrokenPipeError,
+            ConnectionAbortedError):
         pass
     return resp
 
@@ -119,19 +121,22 @@ def test_oversized_body_rejected_413(hardening_server):
     port = hardening_server["http_port"]
     s = socket.create_connection(("127.0.0.1", port), timeout=20)
     try:
-        body = b"x" * (MAX_BODY + 1)  # 1 MiB + 1 byte, declared via Content-Length
+        body_len = MAX_BODY + 1  # 1 MiB + 1 byte, declared via Content-Length
         s.sendall(
             f"POST /api/v1/download HTTP/1.1\r\n"
             f"Host: 127.0.0.1:{port}\r\n"
             f"X-OpenDM-Token: {daemon.TOKEN}\r\n"
             f"Content-Type: application/json\r\n"
-            f"Content-Length: {len(body)}\r\n"
+            f"Content-Length: {body_len}\r\n"
             f"Connection: close\r\n\r\n".encode()
         )
-        try:
-            s.sendall(body)
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # server may RST after responding 413 without reading
+        # The daemon rejects on the headers alone (it never reads an
+        # over-cap body), so the 413 is already on its way. Read it BEFORE
+        # sending any body bytes: on Windows, sending the body first races
+        # with the server's abortive close and surfaces as WSAECONNABORTED
+        # (WinError 10053) instead of a readable 413.
+        r, _, _ = select.select([s], [], [], 5.0)
+        assert r, "server did not reject the oversized Content-Length"
         resp = _recv_all(s)
     finally:
         s.close()
@@ -264,7 +269,11 @@ def test_static_route_sends_connection_close(hardening_server):
 # bind failure -----------------------------------------------------------------
 def test_bind_failure_raises_clear_error():
     blocker = socket.socket()
-    blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # NOTE: no SO_REUSEADDR here on purpose. On Windows, SO_REUSEADDR lets a
+    # second socket bind the same port (unlike POSIX), so setting it on the
+    # blocker would let the daemon bind successfully and the expected
+    # RuntimeError would never fire. A listening socket without SO_REUSEADDR
+    # still blocks a second bind on every platform.
     blocker.bind(("127.0.0.1", 0))
     blocker.listen(1)
     port = blocker.getsockname()[1]
