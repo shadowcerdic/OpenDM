@@ -12,6 +12,7 @@ import threading
 import time
 
 import pytest
+from pathlib import Path
 
 from conftest import make_server, PAYLOAD, PAYLOAD_SHA256
 from opendm import engine
@@ -677,18 +678,21 @@ def test_kill9_resume_final_sha_matches(tmp_path):
     """kill -9 a downloader subprocess mid-way; resume; sha256 must match."""
     import subprocess
     import sys
-    venv_python = "/home/hatch/workspace/opendm/.venv/bin/python"
+    repo_root = str(Path(__file__).resolve().parents[1])
     with make_server({"slow": 0.15}) as server:
         url = server.url("/file.bin")
         dest = str(tmp_path / "kill.bin")
         driver = tmp_path / "dl_driver.py"
         driver.write_text(
             "import sys\n"
-            "sys.path.insert(0, '/home/hatch/workspace/opendm')\n"
+            f"sys.path.insert(0, {repo_root!r})\n"
             "from opendm import engine\n"
             "engine.download(sys.argv[1], dest=sys.argv[2], conns=2)\n"
         )
-        proc = subprocess.Popen([venv_python, str(driver), url, dest])
+        # sys.executable: the test runner's own Python on every platform.
+        # Popen.kill() is SIGKILL on POSIX and TerminateProcess on Windows;
+        # both kill without cleanup, which is exactly what this test needs.
+        proc = subprocess.Popen([sys.executable, str(driver), url, dest])
         try:
             # Wait until the timer has checkpointed real progress (~2s+).
             ok = False
