@@ -32,7 +32,32 @@ CONFIG = load_or_create_config()
 TOKEN = CONFIG["token"]
 HTTP_PORT = int(CONFIG.get("http_port", 10010))
 WS_PORT = int(CONFIG.get("ws_port", 10011))
-ALLOWED_ORIGINS = list(CONFIG.get("allowed_origins", ["chrome-extension://*"]))
+
+# -- allowed origins (spec item 17) ------------------------------------------
+# Trust exactly the configured extension ID(s); the old
+# chrome-extension://* and moz-extension://* wildcards are removed.
+# Real ID hnhmponoadleelhnecpijhnlpefkjflc is derived from the "key" in
+# extension/manifest.json and also configured in
+# opendm/org.opendm.native_host.json and opendm/security.py.
+EXTENSION_ID = "hnhmponoadleelhnecpijhnlpefkjflc"
+DEFAULT_ALLOWED_ORIGINS = [f"chrome-extension://{EXTENSION_ID}"]
+
+
+def _sanitize_origins(raw):
+    """Return origin patterns with wildcard entries removed.
+
+    Stale daemon.json configs may still carry chrome-extension://* /
+    moz-extension://*; drop them so trust never silently widens. When
+    nothing usable remains, fall back to the exact extension ID(s) only.
+    """
+    if isinstance(raw, (list, tuple)):
+        clean = [o for o in raw if isinstance(o, str) and o.strip() and "*" not in o]
+    else:
+        clean = []
+    return clean or list(DEFAULT_ALLOWED_ORIGINS)
+
+
+ALLOWED_ORIGINS = _sanitize_origins(CONFIG.get("allowed_origins"))
 DEST_DIR = CONFIG.get("download_dir", os.path.join(os.path.expanduser("~"), "Downloads"))
 EXT_WWW_DIR = os.path.join(os.path.dirname(config_path()), "www")  # crx + updates.xml
 
