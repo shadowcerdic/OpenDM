@@ -54,8 +54,8 @@ Root: HKCU; Subkey: "Software\Google\Chrome\NativeMessagingHosts\org.opendm.nati
 Root: HKCU; Subkey: "Software\Microsoft\Edge\NativeMessagingHosts\org.opendm.native_host"; ValueType: string; ValueName: ""; ValueData: "{app}\app\opendm\org.opendm.native_host.json"; Flags: uninsdeletekey
 
 [Code]
-; Fill the {app} placeholder in org.opendm.native_host.json with the real
-; install directory so the native-messaging manifest points at this install.
+// Fill the {app} placeholder in org.opendm.native_host.json with the real
+// install directory so the native-messaging manifest points at this install.
 function EscapeJsonBackslashes(const S: String): String;
 var
   i: Integer;
