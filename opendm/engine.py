@@ -337,27 +337,55 @@ def part_path(final_path: str) -> str:
     return f"{final_path}.opendm.part"
 
 
+# Serializes sidecar writes process-wide. Concurrent os.replace() calls to
+# the same destination are unsafe on Windows: the replace can race with file
+# filter drivers (e.g. antivirus real-time scanning on CI runners) that briefly
+# hold the destination open, surfacing as PermissionError [WinError 5].
+_sidecar_lock = threading.Lock()
+
+
+def _replace_with_retry(src: str, dst: str) -> None:
+    """os.replace with retries on transient Windows file locks.
+
+    File filter drivers (antivirus, search indexer) can briefly lock a freshly
+    written file; retrying a few times with backoff is the standard mitigation.
+    A persistent PermissionError still raises after the retries.
+    """
+    last: BaseException | None = None
+    for attempt in range(4):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as ex:
+            last = ex
+            time.sleep(0.05 * (2 ** attempt))
+    assert last is not None
+    raise last
+
+
 def save_sidecar(target_path: str, data: dict):
     """Atomically write sidecar metadata via a unique temp file.
 
     The temp name is unique per call so concurrent checkpoints (timer thread
     and workers) cannot clobber each other's temp file; os.replace keeps the
-    visible sidecar update atomic (last writer wins).
+    visible sidecar update atomic (last writer wins). Writes are serialized
+    by _sidecar_lock so only one replace is ever in flight.
     """
     path = get_sidecar_path(target_path)
     directory = os.path.dirname(os.path.abspath(path))
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".opendm-",
-                               suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, path)
-    except BaseException:
+    with _sidecar_lock:
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".opendm-",
+                                   suffix=".tmp")
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            _replace_with_retry(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
 
 def load_sidecar(target_path: str) -> dict | None:
