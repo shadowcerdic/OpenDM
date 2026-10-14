@@ -164,12 +164,15 @@ def test_preallocated_parallel_write_and_resume(tmp_path):
     except engine.Paused:
         pass
 
-    # Verify sidecar state file exists and file is preallocated
+    # Verify sidecar state file exists and the .part file is preallocated.
+    # The final name must not exist before the completion gate passes.
     sidecar = load_sidecar(dest)
     assert sidecar is not None, "Sidecar state file must exist after pause"
     assert sidecar["total"] == len(data)
-    assert os.path.exists(dest)
-    assert os.path.getsize(dest) == len(data)
+    part = engine.part_path(dest)
+    assert not os.path.exists(dest), "final name must not exist mid-download"
+    assert os.path.exists(part), ".part file must exist after pause"
+    assert os.path.getsize(part) == len(data)
 
     # Resume download cleanly without speed limit
     res = download(url, dest=dest, conns=4)
@@ -214,12 +217,14 @@ def test_mid_segment_200_ok_corruption_guard(tmp_path):
     url = f"http://127.0.0.1:{port}/corrupt_test.dat"
     dest = str(tmp_path / "corrupt_test.dat")
 
-    # With multiple connections, workers for start > 0 will receive 200 OK and abort
-    with pytest.raises(Exception) as excinfo:
+    # With multiple connections, workers for start > 0 will receive 200 OK and abort.
+    # Since item 5, download() raises the original worker error unwrapped:
+    # RemoteFileChanged (mid-file 200 with If-Range sent) or ProtocolViolation
+    # (200 on segment 0 with a multi-segment plan) — whichever worker fails first.
+    with pytest.raises((engine.RemoteFileChanged, engine.ProtocolViolation)):
         download(url, dest=dest, conns=4)
 
     server.shutdown()
-    assert "206" in str(excinfo.value) or "ProtocolViolation" in str(excinfo.value) or "Download workers failed" in str(excinfo.value)
 
 
 def test_etag_if_range_mismatch_on_resume(tmp_path):
