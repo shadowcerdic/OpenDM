@@ -57,6 +57,15 @@ class _DiskError(OSError):
     """
 
 
+class _Aborted(Exception):
+    """Internal: a sibling worker hit a fatal error; stop quietly.
+
+    The shared abort event is set by the first fatal worker error; other
+    workers raise this (instead of doing more work) and download() re-raises
+    the original error.
+    """
+
+
 def _parse_retry_after(value: str | None) -> float | None:
     """Parse a Retry-After header value into seconds, or None if unusable."""
     if not value:
@@ -298,6 +307,7 @@ def _worker_loop(
     last_modified: str | None = None,
     single_segment: bool = True,
     total: int = 0,
+    abort_event: threading.Event | None = None,
 ):
     """Worker handling segment fetching and dynamic work stealing."""
     fd = open(dest_path, "r+b")
@@ -306,6 +316,8 @@ def _worker_loop(
         while current_seg is not None:
             if stop_event is not None and stop_event.is_set():
                 raise Paused()
+            if abort_event is not None and abort_event.is_set():
+                raise _Aborted()
 
             _download_single_segment(
                 url=url,
@@ -322,11 +334,14 @@ def _worker_loop(
                 max_retries=max_retries,
                 single_segment=single_segment,
                 total=total,
+                abort_event=abort_event,
             )
 
             # Segment finished. Attempt work stealing!
             if stop_event is not None and stop_event.is_set():
                 raise Paused()
+            if abort_event is not None and abort_event.is_set():
+                raise _Aborted()
             current_seg = steal_work(segments, seg_lock)
             if current_seg is not None and meta_saver:
                 meta_saver()
@@ -349,6 +364,7 @@ def _download_single_segment(
     last_modified: str | None = None,
     single_segment: bool = True,
     total: int = 0,
+    abort_event: threading.Event | None = None,
 ):
     """Fetch assigned segment range directly writing to preallocated fd."""
     handlers = []
@@ -364,6 +380,8 @@ def _download_single_segment(
     while True:
         if stop_event is not None and stop_event.is_set():
             raise Paused()
+        if abort_event is not None and abort_event.is_set():
+            raise _Aborted()
 
         with seg_lock:
             pos = seg.cursor
@@ -433,6 +451,8 @@ def _download_single_segment(
                 while True:
                     if stop_event is not None and stop_event.is_set():
                         raise Paused()
+                    if abort_event is not None and abort_event.is_set():
+                        raise _Aborted()
 
                     with seg_lock:
                         current_end = seg.end
@@ -487,6 +507,8 @@ def _download_single_segment(
             return
         except Paused:
             raise
+        except _Aborted:
+            raise
         except _DiskError:
             raise
         except (ProtocolViolation, RemoteFileChanged):
@@ -505,18 +527,18 @@ def _download_single_segment(
             if attempt > max_retries or (stop_event is not None and stop_event.is_set()):
                 raise
             _interruptible_sleep(
-                stop_event, None,
+                stop_event, abort_event,
                 wait if wait is not None else min(2 ** attempt * 0.5, 5.0))
         except OSError as ex:
             attempt += 1
             if attempt > max_retries or (stop_event is not None and stop_event.is_set()):
                 raise RuntimeError(f"Network error after {attempt} attempts: {ex}")
-            _interruptible_sleep(stop_event, None, min(2 ** attempt * 0.5, 5.0))
+            _interruptible_sleep(stop_event, abort_event, min(2 ** attempt * 0.5, 5.0))
         except Exception as ex:
             attempt += 1
             if attempt > max_retries or (stop_event is not None and stop_event.is_set()):
                 raise RuntimeError(f"Network error after {attempt} attempts: {ex}")
-            _interruptible_sleep(stop_event, None, min(2 ** attempt * 0.5, 5.0))
+            _interruptible_sleep(stop_event, abort_event, min(2 ** attempt * 0.5, 5.0))
 
 
 def compute_sha256(filepath: str, total_size: int = -1) -> str:
@@ -663,6 +685,10 @@ def download(
     save_meta()
 
     errors = []
+    err_lock = threading.Lock()
+
+    # Shared abort: the first fatal worker error sets it so siblings stop.
+    abort_event = threading.Event()
 
     # A 200 on segment 0 is a full stream only for a single-segment plan.
     single_segment = len(segments) == 1
@@ -684,11 +710,17 @@ def download(
                 proxy=proxy,
                 single_segment=single_segment,
                 total=total,
+                abort_event=abort_event,
             )
         except Paused:
             pass
+        except _Aborted:
+            pass
         except Exception as ex:
-            errors.append(ex)
+            with err_lock:
+                if not errors:
+                    errors.append(ex)
+            abort_event.set()
 
     # Launch worker threads
     ths = []
@@ -710,7 +742,7 @@ def download(
     emit_parts()
 
     if errors:
-        raise RuntimeError(f"Download workers failed: {errors[0]!r}")
+        raise errors[0]
 
     # Verification: check all segments completed
     with seg_lock:

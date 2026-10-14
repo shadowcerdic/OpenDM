@@ -447,7 +447,7 @@ def test_200_on_segment0_multi_segment_download_fails(tmp_path):
     srv, url = _serve_with(_FirstSeg200Handler)
     try:
         dest = str(tmp_path / "mm.bin")
-        with pytest.raises(RuntimeError, match="multiple segments"):
+        with pytest.raises(engine.ProtocolViolation, match="multiple segments"):
             engine.download(url, dest=dest, conns=4)
     finally:
         srv.shutdown()
@@ -511,6 +511,92 @@ def test_full_stream_stops_at_known_total(tmp_path):
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+# ---------------------------------------------------------------------------
+# Item 5: fail fast — first fatal worker error sets a shared abort event so
+# siblings stop; download() raises that original error (not a wrapper).
+# ---------------------------------------------------------------------------
+
+class _FailFastTrickleHandler(http.server.BaseHTTPRequestHandler):
+    """Seg-0 range gets an instant 200 (fatal); other ranges trickle slowly."""
+
+    def log_message(self, *a):
+        pass
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(PAYLOAD)))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("ETag", '"strong-1"')
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+    def do_GET(self):
+        rng = self.headers.get("Range") or ""
+        try:
+            if rng.startswith("bytes=0-"):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(PAYLOAD)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(PAYLOAD)
+            else:
+                spec = rng.split("=", 1)[1]
+                a, b = spec.split("-", 1)
+                s, e = int(a), int(b) if b else len(PAYLOAD) - 1
+                data = PAYLOAD[s:e + 1]
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {s}-{e}/{len(PAYLOAD)}")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                for i in range(0, len(data), 65536):
+                    self.wfile.write(data[i:i + 65536])
+                    self.wfile.flush()
+                    time.sleep(0.5)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        self.close_connection = True
+
+
+def test_fail_fast_first_error_aborts_siblings(tmp_path):
+    """The seg-0 200 is fatal: siblings must stop at once and the original
+    ProtocolViolation (not a wrapper) must propagate from download()."""
+    srv, url = _serve_with(_FailFastTrickleHandler)
+    try:
+        dest = str(tmp_path / "ff.bin")
+        t0 = time.time()
+        with pytest.raises(engine.ProtocolViolation):
+            engine.download(url, dest=dest, conns=4)
+        dt = time.time() - t0
+        # Siblings trickle ~16s to completion; abort must cut that short.
+        assert dt < 8.0, f"siblings were not aborted promptly ({dt:.1f}s)"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_abort_event_interrupts_retry_backoff(tmp_path):
+    """A worker sleeping in retry backoff must wake up when abort is set."""
+    with make_server({"paths": {"/b503": {"status": 503, "retry_after": 30}}}) as server:
+        dest = str(tmp_path / "ab.bin")
+        engine.preallocate_file(dest, 4096)
+        seg = engine.Segment(0, 0, 4095)
+        lock = threading.Lock()
+        abort = threading.Event()
+        threading.Timer(0.5, abort.set).start()
+        t0 = time.time()
+        with open(dest, "r+b") as fd:
+            with pytest.raises(engine._Aborted):
+                engine._download_single_segment(
+                    url=server.url("/b503"), seg=seg, fd=fd, seg_lock=lock,
+                    stop_event=None, on_bytes=None, extra_headers=None,
+                    etag=None, meta_saver=None, max_retries=5,
+                    abort_event=abort)
+        dt = time.time() - t0
+        assert dt < 5.0, f"backoff was not interrupted ({dt:.1f}s)"
 
 
 # ---------------------------------------------------------------------------
