@@ -296,6 +296,8 @@ def _worker_loop(
     proxy: str | None = None,
     max_retries: int = 5,
     last_modified: str | None = None,
+    single_segment: bool = True,
+    total: int = 0,
 ):
     """Worker handling segment fetching and dynamic work stealing."""
     fd = open(dest_path, "r+b")
@@ -318,6 +320,8 @@ def _worker_loop(
                 meta_saver=meta_saver,
                 proxy=proxy,
                 max_retries=max_retries,
+                single_segment=single_segment,
+                total=total,
             )
 
             # Segment finished. Attempt work stealing!
@@ -343,6 +347,8 @@ def _download_single_segment(
     proxy: str | None = None,
     max_retries: int = 5,
     last_modified: str | None = None,
+    single_segment: bool = True,
+    total: int = 0,
 ):
     """Fetch assigned segment range directly writing to preallocated fd."""
     handlers = []
@@ -413,8 +419,16 @@ def _download_single_segment(
                 if etag and r.status == 200 and pos > 0:
                     raise RemoteFileChanged("Server returned 200 on range request with If-Range; file changed.")
 
-                # Fallback check for status 200 on pos == 0
+                # A 200 on segment 0 is a full stream only when the plan has
+                # exactly one segment; otherwise the server is ignoring Range
+                # and the stream would overwrite sibling segments.
                 is_full_stream = (r.status == 200 and pos == 0)
+                if is_full_stream and not single_segment:
+                    raise ProtocolViolation(
+                        f"Server returned 200 OK for range request "
+                        f"bytes={pos}-{current_end} but the plan has multiple "
+                        f"segments; refusing to overwrite sibling segments"
+                    )
 
                 while True:
                     if stop_event is not None and stop_event.is_set():
@@ -424,10 +438,15 @@ def _download_single_segment(
                         current_end = seg.end
                         curr_pos = seg.cursor
 
-                    if curr_pos > current_end and not is_full_stream:
-                        break  # Segment was stolen/shortened from behind, range complete
+                    # A full stream with known total stops at total.
+                    eff_end = current_end
+                    if is_full_stream and total > 0:
+                        eff_end = min(current_end, total - 1)
 
-                    chunk_limit = min(65536, current_end - curr_pos + 1) if not is_full_stream else 65536
+                    if curr_pos > eff_end:
+                        break  # Range complete (or segment stolen/shortened)
+
+                    chunk_limit = min(65536, eff_end - curr_pos + 1)
                     buf = r.read(chunk_limit)
                     if not buf:
                         if not is_full_stream:
@@ -645,6 +664,9 @@ def download(
 
     errors = []
 
+    # A 200 on segment 0 is a full stream only for a single-segment plan.
+    single_segment = len(segments) == 1
+
     def run_worker(initial_seg):
         try:
             _worker_loop(
@@ -660,6 +682,8 @@ def download(
                 last_modified=last_modified,
                 meta_saver=save_meta,
                 proxy=proxy,
+                single_segment=single_segment,
+                total=total,
             )
         except Paused:
             pass

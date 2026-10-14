@@ -382,3 +382,135 @@ def test_resume_last_modified_match_continues(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Item 4: 200 on segment 0 is a full stream only for a single-segment plan;
+# with several segments it is a ProtocolViolation. Full streams stop at total.
+# ---------------------------------------------------------------------------
+
+class _FirstSeg200Handler(http.server.BaseHTTPRequestHandler):
+    """Returns 200 + full body for ranges starting at 0, proper 206 otherwise."""
+
+    def log_message(self, *a):
+        pass
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(PAYLOAD)))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("ETag", '"strong-1"')
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+    def do_GET(self):
+        rng = self.headers.get("Range") or ""
+        try:
+            if rng.startswith("bytes=0-"):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(PAYLOAD)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(PAYLOAD)
+            else:
+                spec = rng.split("=", 1)[1]
+                a, b = spec.split("-", 1)
+                s, e = int(a), int(b) if b else len(PAYLOAD) - 1
+                data = PAYLOAD[s:e + 1]
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {s}-{e}/{len(PAYLOAD)}")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        self.close_connection = True
+
+
+def test_200_on_segment0_with_multi_segment_plan_raises(tmp_path):
+    """Unit: 200 on seg 0 with a multi-segment plan -> ProtocolViolation."""
+    with make_server({"ignore_range": True}) as server:
+        dest = str(tmp_path / "m.bin")
+        engine.preallocate_file(dest, len(PAYLOAD))
+        seg = engine.Segment(0, 0, 4095)
+        lock = threading.Lock()
+        with open(dest, "r+b") as fd:
+            with pytest.raises(engine.ProtocolViolation):
+                engine._download_single_segment(
+                    url=server.url("/file.bin"), seg=seg, fd=fd, seg_lock=lock,
+                    stop_event=None, on_bytes=None, extra_headers=None,
+                    etag='"0d4d-etag-1"', meta_saver=None, max_retries=1,
+                    single_segment=False, total=len(PAYLOAD))
+
+
+def test_200_on_segment0_multi_segment_download_fails(tmp_path):
+    """Integration: server 200s the seg-0 range while plan has 4 segments."""
+    srv, url = _serve_with(_FirstSeg200Handler)
+    try:
+        dest = str(tmp_path / "mm.bin")
+        with pytest.raises(RuntimeError, match="multiple segments"):
+            engine.download(url, dest=dest, conns=4)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_200_single_segment_full_stream_ok(tmp_path):
+    """Unit: 200 on seg 0 with a single-segment plan is accepted as full stream."""
+    import hashlib
+    with make_server({"ignore_range": True}) as server:
+        dest = str(tmp_path / "f.bin")
+        engine.preallocate_file(dest, len(PAYLOAD))
+        seg = engine.Segment(0, 0, len(PAYLOAD) - 1)
+        lock = threading.Lock()
+        with open(dest, "r+b") as fd:
+            engine._download_single_segment(
+                url=server.url("/file.bin"), seg=seg, fd=fd, seg_lock=lock,
+                stop_event=None, on_bytes=None, extra_headers=None,
+                etag=None, last_modified=None, meta_saver=None, max_retries=1,
+                single_segment=True, total=len(PAYLOAD))
+        assert seg.cursor == len(PAYLOAD)
+        assert hashlib.sha256(open(dest, "rb").read()).hexdigest() == PAYLOAD_SHA256
+
+
+class _OvershootHandler(http.server.BaseHTTPRequestHandler):
+    """200 with MORE bytes than the known total (runaway stream)."""
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        body = PAYLOAD + b"GARBAGE" * 4096
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        self.close_connection = True
+
+
+def test_full_stream_stops_at_known_total(tmp_path):
+    """A full stream with known total must stop at total, not read past it."""
+    srv, url = _serve_with(_OvershootHandler)
+    try:
+        dest = str(tmp_path / "o.bin")
+        engine.preallocate_file(dest, len(PAYLOAD))
+        seg = engine.Segment(0, 0, len(PAYLOAD) - 1)
+        lock = threading.Lock()
+        with open(dest, "r+b") as fd:
+            engine._download_single_segment(
+                url=url, seg=seg, fd=fd, seg_lock=lock,
+                stop_event=None, on_bytes=None, extra_headers=None,
+                etag=None, last_modified=None, meta_saver=None, max_retries=1,
+                single_segment=True, total=len(PAYLOAD))
+        assert seg.cursor == len(PAYLOAD), \
+            f"stream must stop at total, cursor={seg.cursor}"
+        assert open(dest, "rb").read() == PAYLOAD
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+# ---------------------------------------------------------------------------
