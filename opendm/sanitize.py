@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 import urllib.parse
 from pathlib import Path
 
@@ -12,9 +13,62 @@ WINDOWS_RESERVED = {
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
 }
-# Characters invalid on Windows and dangerous on POSIX
-INVALID_CHARS = re.compile(r'[\x00-\x1f\x7f<>:"/\\|?*\'#]')
+# Characters invalid on Windows and dangerous on POSIX.
+# Apostrophe (') and '#' are legal in filenames and are intentionally kept.
+INVALID_CHARS = re.compile(r'[\x00-\x1f\x7f<>:"/\\|?*]')
+# Bidi / invisible characters used for spoofing (RLO attacks etc.).
+# U+200C (ZWNJ) and U+200D (ZWJ) are deliberately NOT in this set: they are
+# required for correct Persian/Indic spelling and are not spoofing vectors
+# in the same way.
+BIDI_CONTROLS = re.compile(
+    "[\u202A-\u202E"  # LRE, RLE, PDF, LRO, RLO
+    "\u2066-\u2069"  # LRI, RLI, FSI, PDI
+    "\u200E\u200F"  # LRM, RLM
+    "\u061C"  # ALM (Arabic letter mark)
+    "\u200B"  # zero-width space
+    "\u2060"  # word joiner
+    "\uFEFF]"  # BOM / ZWNBSP
+)
 MAX_FILENAME_LEN = 240
+MAX_FILENAME_BYTES = 255
+# Windows MAX_PATH-style limit: 260 chars full path / 247 for dir+name.
+# Only enforced on Windows (os.name == "nt").
+WINDOWS_MAX_PATH_NAME_CHARS = 247
+
+
+def _truncate_stem_chars(name: str, limit: int) -> str:
+    """Truncate name to at most ``limit`` characters, preserving extension."""
+    if len(name) <= limit:
+        return name
+    if "." in name and not name.startswith("."):
+        stem, ext = name.rsplit(".", 1)
+        ext = "." + ext[:20]
+        stem = stem[: max(0, limit - len(ext))]
+        return stem + ext
+    return name[:limit]
+
+
+def _truncate_stem_bytes(name: str, limit: int) -> str:
+    """Truncate name so its UTF-8 encoding is at most ``limit`` bytes.
+
+    Truncates the stem (preserving the extension) on a character boundary so
+    no multi-byte character is split.
+    """
+    if len(name.encode("utf-8")) <= limit:
+        return name
+    if "." in name and not name.startswith("."):
+        stem, ext = name.rsplit(".", 1)
+        ext = "." + ext[:20]
+    else:
+        stem, ext = name, ""
+    lo, hi = 0, len(stem)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len((stem[:mid] + ext).encode("utf-8")) <= limit:
+            lo = mid
+        else:
+            hi = mid - 1
+    return stem[:lo] + ext
 
 
 def parse_content_disposition(header: str | None) -> str | None:
@@ -57,13 +111,19 @@ def sanitize_filename(
     default: str = "download.bin",
     max_len: int = MAX_FILENAME_LEN,
 ) -> str:
-    """Sanitize filename against path traversal, control chars, and OS restrictions.
+    r"""Sanitize filename against path traversal, control chars, and OS restrictions.
 
     - strips path separators (/ and \)
     - decodes percent-encoded traversal like %2e%2e%2f
+    - strips bidi / invisible spoofing characters (RLO etc.), zero-width
+      space, word joiner, BOM; keeps U+200C (ZWNJ) and U+200D (ZWJ)
+    - NFC-normalizes the name
     - rejects / strips control characters and Windows-invalid chars (<>:"/\\|?*)
+      while keeping legal ' (apostrophe) and #
     - renames Windows-reserved names (CON -> _CON)
-    - truncates base name if filename exceeds max_len (preserving extension)
+    - truncates the stem (preserving extension) so the name fits max_len
+      characters, the Windows MAX_PATH limit (Windows only), and
+      MAX_FILENAME_BYTES UTF-8 bytes (all platforms)
     - strips leading/trailing dots and spaces
     - ensures non-empty return
     """
@@ -79,7 +139,13 @@ def sanitize_filename(
     # remove directory components (strip all path separators)
     name = re.sub(r"[/\\]+", "", name)
 
-    # replace null and control characters with nothing
+    # strip bidi controls and invisible spoofing characters
+    name = BIDI_CONTROLS.sub("", name)
+
+    # normalize to composed form (canonical equivalent spellings unify)
+    name = unicodedata.normalize("NFC", name)
+
+    # remove null and control characters
     name = re.sub(r"[\x00-\x1f\x7f]", "", name)
 
     # replace forbidden filesystem characters with underscore
@@ -96,15 +162,13 @@ def sanitize_filename(
     if stem in WINDOWS_RESERVED:
         name = "_" + name
 
-    # truncate if overly long while preserving extension
-    if len(name) > max_len:
-        if "." in name:
-            stem, ext = name.rsplit(".", 1)
-            ext = "." + ext[:20]
-            stem = stem[: max_len - len(ext)]
-            name = stem + ext
-        else:
-            name = name[:max_len]
+    # truncate while preserving the extension
+    name = _truncate_stem_chars(name, max_len)
+    # Windows MAX_PATH-style guard (Windows only)
+    if os.name == "nt" and len(name) > WINDOWS_MAX_PATH_NAME_CHARS:
+        name = _truncate_stem_chars(name, WINDOWS_MAX_PATH_NAME_CHARS)
+    # UTF-8 byte limit, enforced on all platforms
+    name = _truncate_stem_bytes(name, MAX_FILENAME_BYTES)
 
     return name or default
 

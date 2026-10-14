@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import sys
 from pathlib import Path
 
 DEFAULT_HTTP_PORT = 10010
@@ -16,10 +17,20 @@ ALLOWED_HOSTS = {
 }
 
 
-def config_dir() -> Path:
+def config_dir(app: str = "opendm") -> Path:
+    """Return the per-user config directory for an OpenDM app.
+
+    POSIX: $XDG_CONFIG_HOME/<app> (or ~/.config/<app>). Windows
+    (sys.platform == "win32"): %APPDATA%\\OpenDM. The Windows path is
+    guarded by sys.platform so it can be exercised with mocks on Linux;
+    it is unverified on real Windows.
+    """
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / "OpenDM"
     base = os.environ.get("XDG_CONFIG_HOME")
     p = Path(base) if base else Path.home() / ".config"
-    return p / "opendm"
+    return p / app
 
 
 def config_path() -> Path:
@@ -47,8 +58,6 @@ def load_or_create_config() -> dict:
         "download_dir": str(Path.home() / "Downloads"),
         "allowed_origins": [
             "chrome-extension://hnhmponoadleelhnecpijhnlpefkjflc",
-            "chrome-extension://*",
-            "moz-extension://*",
         ],
     }
     tmp = cp.with_suffix(".tmp")

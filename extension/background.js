@@ -21,11 +21,15 @@ chrome.runtime.onInstalled.addListener(() => {
  * Bootstrap session token securely:
  * 1. Checks storage cache.
  * 2. If missing, requests via Chrome Native Messaging (stdin/stdout) without exposing secrets over HTTP.
+ * Pass forceRefresh=true to bypass the cache (e.g. after a 401) and re-fetch
+ * the token via native messaging.
  */
-async function getToken() {
-  const cfg = await chrome.storage.local.get(["opendm_token"]);
-  if (cfg.opendm_token) {
-    return cfg.opendm_token;
+async function getToken(forceRefresh = false) {
+  if (!forceRefresh) {
+    const cfg = await chrome.storage.local.get(["opendm_token"]);
+    if (cfg.opendm_token) {
+      return cfg.opendm_token;
+    }
   }
 
   // Attempt Native Messaging handshake
@@ -51,8 +55,14 @@ async function getToken() {
   return "";
 }
 
+/**
+ * Sends a download job to the OpenDM daemon.
+ * Returns true ONLY if the daemon positively accepted the job ({ok:true} on 2xx).
+ * Returns false on daemon unreachable, non-ok response, or exception.
+ * On 401: clears the cached token, re-fetches it via native messaging, and
+ * retries the request exactly once before giving up.
+ */
 async function sendToDaemon(url, headers, suggestedFilename) {
-  const token = await getToken();
   const payload = {
     url,
     connections: 4,
@@ -61,28 +71,63 @@ async function sendToDaemon(url, headers, suggestedFilename) {
     ...(suggestedFilename ? { suggested_filename: suggestedFilename } : {})
   };
 
-  try {
-    const res = await fetch(DEFAULT_DAEMON_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(token ? { "X-OpenDM-Token": token } : {})
-      },
-      body: JSON.stringify(payload)
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      if (res.status === 401) {
-        // Token was invalid or rotated; clear local cache to trigger refresh
-        await chrome.storage.local.remove(["opendm_token"]);
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const token = await getToken(/* forceRefresh */ attempt > 1);
+    try {
+      const res = await fetch(DEFAULT_DAEMON_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { "X-OpenDM-Token": token } : {})
+        },
+        body: JSON.stringify(payload)
+      });
+
+      let data = null;
+      try {
+        data = await res.json();
+      } catch (e) {
+        data = null;
       }
-      console.error("OpenDM rejected:", data);
-    } else {
-      console.log("OpenDM queued:", data);
+
+      if (res.status === 401) {
+        // Token invalid or rotated: drop the cache and retry exactly once
+        // with a freshly-fetched token.
+        await chrome.storage.local.remove(["opendm_token"]);
+        if (attempt === 1) {
+          console.warn("OpenDM: 401 from daemon, refreshing token and retrying once");
+          continue;
+        }
+        console.error("OpenDM rejected (401 after retry):", data);
+        return false;
+      }
+
+      if (res.ok && data && data.ok === true) {
+        console.log("OpenDM queued:", data);
+        return true;
+      }
+      console.error("OpenDM rejected:", res.status, data);
+      return false;
+    } catch (err) {
+      console.error("OpenDM daemon unreachable:", err);
+      return false;
     }
-  } catch (err) {
-    console.error("OpenDM daemon unreachable:", err);
   }
+  return false;
+}
+
+/** Surface failures to the user: badge (no new permission needed) + console. */
+function showErrorBadge() {
+  try {
+    chrome.action.setBadgeText({ text: "!" });
+    chrome.action.setBadgeBackgroundColor({ color: "#d73a49" });
+    setTimeout(clearErrorBadge, 10000);
+  } catch (e) {}
+}
+function clearErrorBadge() {
+  try {
+    chrome.action.setBadgeText({ text: "" });
+  } catch (e) {}
 }
 
 async function collectHeaders(url, referrer) {
@@ -103,7 +148,10 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   await sendToDaemon(url, headers, null);
 });
 
-// Auto-catch: cancel Chrome download and send to OpenDM
+// Auto-catch: send the download to OpenDM, and cancel Chrome's native
+// download ONLY after the daemon confirms it accepted the job ({ok:true}).
+// If the daemon is unreachable or rejects the job, the browser download
+// proceeds normally so the user's download is never lost.
 chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
   chrome.storage.local.get(["opendm_autocatch"], async res => {
     const autocatch = (res.opendm_autocatch !== false);
@@ -117,13 +165,28 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
       return;
     }
 
-    chrome.downloads.cancel(item.id, () => {
-      chrome.downloads.erase({ id: item.id });
-    });
-
     const filename = item.filename ? item.filename.split(/[\\/]/).pop() : null;
     const headers = await collectHeaders(url, item.referrer || "");
-    await sendToDaemon(url, headers, filename);
+
+    let accepted = false;
+    try {
+      accepted = await sendToDaemon(url, headers, filename);
+    } catch (err) {
+      console.error("OpenDM send failed:", err);
+      accepted = false;
+    }
+
+    if (accepted) {
+      // Daemon confirmed it took the job — now cancel the native download.
+      chrome.downloads.cancel(item.id, () => {
+        chrome.downloads.erase({ id: item.id });
+      });
+      clearErrorBadge();
+    } else {
+      // Daemon did not take the job — let the browser download normally.
+      showErrorBadge();
+      suggest();
+    }
   });
   return true;
 });

@@ -3,7 +3,7 @@
 ; OpenDM source code, shortcuts, and Chrome Native Messaging Host registry keys.
 
 #define MyAppName "OpenDM"
-#define MyAppVersion "2.0.0"
+#define MyAppVersion "2.0.1"
 #define MyAppPublisher "OpenDM Project"
 #define MyAppURL "https://github.com/shadowcerdic/OpenDM"
 #define MyAppExeName "OpenDM.exe"
@@ -46,8 +46,48 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\python\pythonw.exe"; Parame
 Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\python\pythonw.exe"; Parameters: "-m opendm.gui"; WorkingDir: "{app}\app"; Tasks: startupicon
 
 [Registry]
-; Register Chrome Native Messaging Host for OpenDM session token bootstrapping
+; Register Native Messaging Host for OpenDM session token bootstrapping.
+; The manifest installed by [Files] is a template carrying a literal {app}
+; placeholder; the [Code] section renders it with the real install path below.
+; Keys are removed automatically on uninstall (uninsdeletekey).
 Root: HKCU; Subkey: "Software\Google\Chrome\NativeMessagingHosts\org.opendm.native_host"; ValueType: string; ValueName: ""; ValueData: "{app}\app\opendm\org.opendm.native_host.json"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Microsoft\Edge\NativeMessagingHosts\org.opendm.native_host"; ValueType: string; ValueName: ""; ValueData: "{app}\app\opendm\org.opendm.native_host.json"; Flags: uninsdeletekey
+
+[Code]
+; Fill the {app} placeholder in org.opendm.native_host.json with the real
+; install directory so the native-messaging manifest points at this install.
+function EscapeJsonBackslashes(const S: String): String;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 1 to Length(S) do
+  begin
+    if S[i] = '\' then
+      Result := Result + '\\'
+    else
+      Result := Result + S[i];
+  end;
+end;
+
+procedure RenderNativeHostManifest();
+var
+  ManifestPath, Content, InstallDir: String;
+begin
+  ManifestPath := ExpandConstant('{app}\app\opendm\org.opendm.native_host.json');
+  if not LoadStringFromFile(ManifestPath, Content) then
+    RaiseException('OpenDM: could not read native host manifest template: ' + ManifestPath);
+  InstallDir := EscapeJsonBackslashes(ExpandConstant('{app}'));
+  StringChangeEx(Content, '{app}', InstallDir, True);
+  if not SaveStringToFile(ManifestPath, Content, False) then
+    RaiseException('OpenDM: could not write native host manifest: ' + ManifestPath);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    RenderNativeHostManifest();
+end;
 
 [Run]
 Filename: "{app}\python\pythonw.exe"; Parameters: "-m opendm.gui"; WorkingDir: "{app}\app"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
