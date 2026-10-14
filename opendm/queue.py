@@ -11,7 +11,11 @@ from pathlib import Path
 from . import engine
 from .sanitize import sanitize_filename, unique_destination
 
-STATES = ("queued", "downloading", "paused", "completed", "error", "assembling")
+STATES = ("queued", "downloading", "paused", "completed", "error", "assembling", "canceled")
+
+# How long resume() waits for a previous worker thread to exit before
+# starting a fresh one.
+_WORKER_JOIN_TIMEOUT = 10.0
 
 DEFAULT_CATEGORIES = {
     "General": ("*",),
@@ -118,11 +122,20 @@ class Job:
         self._stop = threading.Event()
         self._thread = None
         self._on_change = None
+        # Intent flag: set by cancel(), read by the worker thread in _run so
+        # the terminal "canceled" state is never overwritten by a stale
+        # Paused/exception handler. Cleared on every fresh start().
+        self._cancel_requested = False
 
     def start(self):
+        # Canceled jobs are terminal: start() is a no-op for them, just
+        # like resume() (see cancel()).
+        if self.state == "canceled":
+            return
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        self._cancel_requested = False
         self.state = "downloading"
         self._notify()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -135,13 +148,67 @@ class Job:
             self._notify()
 
     def cancel(self):
+        """Cancel the job permanently.
+
+        Records the cancel intent, stops the worker, removes the .part
+        file and sidecar, and moves the job to the terminal "canceled"
+        state. If a worker thread is in flight it transitions to
+        "canceled" itself when it exits (see _run); otherwise the state
+        is set immediately. A canceled job cannot be resumed: resume()
+        (and start()) are documented no-ops.
+        """
+        self._cancel_requested = True
         self._stop.set()
-        self.state = "error"
-        self.error = "canceled"
-        self._notify()
+        self._remove_part_and_sidecar()
+        thr = self._thread
+        if not (thr and thr.is_alive()):
+            self.state = "canceled"
+            self.error = "canceled"
+            self.finished = time.time()
+            self._notify()
+        # else: the running worker sets state="canceled" in _run on exit.
+
+    def _remove_part_and_sidecar(self):
+        """Best-effort removal of the in-progress .part file and sidecars."""
+        part = _part_path(self.dest)
+        candidates = {part}
+        scp = getattr(engine, "get_sidecar_path", None)
+        if callable(scp):
+            try:
+                candidates.add(scp(self.dest))
+                candidates.add(scp(part))
+            except Exception:
+                pass
+        candidates.add(self.dest + ".opendm")
+        candidates.add(part + ".opendm")
+        for p in candidates:
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
 
     def resume(self):
+        """Resume a paused or errored job.
+
+        If the previous worker thread is still exiting (e.g. resume()
+        called right after pause()), waits for it (join with timeout)
+        before starting a fresh worker -- never starts a second worker on
+        top of a live one, and never silently no-ops while the old thread
+        is still running (raises RuntimeError if it refuses to exit).
+
+        No-op on canceled jobs: cancellation is terminal (see cancel()).
+        """
+        if self.state == "canceled":
+            return
         if self.state in ("paused", "error"):
+            thr = self._thread
+            if (thr is not None and thr is not threading.current_thread()
+                    and thr.is_alive()):
+                thr.join(timeout=_WORKER_JOIN_TIMEOUT)
+                if thr.is_alive():
+                    raise RuntimeError(
+                        f"job {self.id}: previous worker thread did not exit")
             self.start()
 
     def _notify(self):
@@ -165,14 +232,32 @@ class Job:
             self.sha256 = res.get("sha256")
             self.total = res.get("size", self.total)
             self.done = self.total
-            self.state = "completed"
+            if self._cancel_requested:
+                # Cancel won the race with a successful return: the terminal
+                # "canceled" state must not be overwritten by "completed".
+                self.state = "canceled"
+                self.error = "canceled"
+            else:
+                self.state = "completed"
             self.finished = time.time()
             self._notify()
         except engine.Paused:
-            self.state = "paused"
+            if self._cancel_requested:
+                self.state = "canceled"
+                self.error = "canceled"
+                self.finished = time.time()
+            else:
+                self.state = "paused"
             self._notify()
         except Exception as ex:
-            if self.state != "error":
+            if self._cancel_requested:
+                # e.g. cancel() deleted the .part file out from under the
+                # worker: the cancel intent still wins over "error".
+                self.state = "canceled"
+                self.error = "canceled"
+                self.finished = time.time()
+                self._notify()
+            elif self.state != "error":
                 self.state = "error"
                 self.error = str(ex)
                 self._notify()
