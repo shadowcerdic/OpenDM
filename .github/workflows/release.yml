@@ -190,7 +190,7 @@ jobs:
             - **Chrome Extension (Manifest v3)**: [OpenDM-Chrome-Extension.zip](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/OpenDM-Chrome-Extension.zip)
             
             ### What's New
-            - **Pre-allocation & Lock-Free I/O**: Target files pre-allocated with direct seek writes (zero `.part` files, zero post-download linear `assemble()` wait).
+            - **Partial-file safety**: bytes go to `<file>.opendm.part` and are atomically renamed to the final name only after the completion gate. There is no post-download `assemble()` step.
             - **Dynamic In-Flight Work Stealing**: Automatically detects slowed sockets and splits remaining segments in-flight aligned to 4KB pages.
             - **Protocol Safety**: Mid-segment 200 OK corruption guard and ETag / `If-Range` validation on Resume.
             - **Chrome Native Messaging**: Token bootstrap directly via standard stdin/stdout without exposing credentials over HTTP.

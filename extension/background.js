@@ -1,4 +1,4 @@
-// OpenDM Integration v2.0.0 — secure Native Messaging token bootstrapping
+// OpenDM Integration v2.0.2 — secure Native Messaging token bootstrapping
 const DEFAULT_DAEMON_URL = "http://127.0.0.1:10010/api/v1/download";
 const NATIVE_HOST_NAME = "org.opendm.native_host";
 
