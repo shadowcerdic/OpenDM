@@ -125,6 +125,21 @@ class TestStagedRender:
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_windows_install_dir_uses_single_separators(self):
+        """Regression lock: a Windows install dir must render with one separator.
+
+        The template stores one JSON-escaped backslash after {app}. The
+        installer escapes the install dir again. The parsed path Chrome
+        reads must not contain a doubled separator.
+        """
+        install = "C:" + chr(92) + "Program Files" + chr(92) + "OpenDM"
+        rendered = render_manifest_like_installer(TEMPLATE.read_text(), Path(install))
+        doc = json.loads(rendered)
+        sep = chr(92)
+        expected = install + sep + "app" + sep + "opendm" + sep + "native_host.bat"
+        assert sep + sep not in doc["path"]
+        assert doc["path"] == expected, doc["path"]
+
     def test_bat_paths_resolve_inside_staged_dir(self):
         """The %~dp0-relative references in the .bat must resolve under staged {app}."""
         tmp = Path(tempfile.mkdtemp(prefix="opendm-item19-"))

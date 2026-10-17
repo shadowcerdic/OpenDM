@@ -162,6 +162,27 @@ def test_22d_get_pip_hash_verified():
     assert re.search(r"(?i)\bthrow\b", dl)
 
 
+def test_22d_get_pip_pin_matches_vendored_file():
+    """ci/get-pip.py is the content-addressed bootstrapper.
+
+    The workflow pin must be its SHA-256. A mismatch must be able to throw
+    before the bootstrapper runs. The rolling URL is not fetched at build time.
+    """
+    import hashlib
+    dl = _step_block("Prepare Staged Windows Runtime & Payload")
+    m = re.search(r'GET_PIP_SHA256\s*=\s*"([0-9a-fA-F]{64})"', dl)
+    assert m, "GET_PIP_SHA256 must be a 64-hex pin, not a placeholder"
+    assert "TODO" not in dl
+    assert "skipping get-pip.py hash verification" not in dl
+    assert "bootstrap.pypa.io/get-pip.py" not in dl
+    vendored = Path(__file__).resolve().parents[1] / "ci" / "get-pip.py"
+    assert vendored.is_file(), "ci/get-pip.py missing"
+    actual = hashlib.sha256(vendored.read_bytes()).hexdigest()
+    assert actual == m.group(1).lower()
+    run_at = dl.index("get-pip.py --no-warn-script-location")
+    assert "throw" in dl[:run_at].lower()
+
+
 def test_prepublish_asset_guard_exists():
     text = _text()
     pub = text.index("Publish GitHub Release")

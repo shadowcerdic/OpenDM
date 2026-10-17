@@ -44,12 +44,10 @@ jobs:
           # but no plain-text checksum file). Re-verify against the .sigstore
           # bundle before rotating this value.
           $PYTHON_EMBED_SHA256 = "8d3f33be9eb810f23c102f08475af2854e50484b8e4e06275e937be61ce3d2fb"
-          # get-pip.py is a rolling file; bootstrap.pypa.io publishes NO official
-          # hash for it, so the expected value below cannot be filled from an
-          # authoritative source.
-          # INCOMPLETE (spec item 22d): fill GET_PIP_SHA256 once an official
-          # checksum is published, or vendor a content-addressed copy.
-          $GET_PIP_SHA256 = "TODO: fill from official bootstrap.pypa.io checksum"
+          # get-pip has no published checksum. ci/get-pip.py is the vendored
+          # copy; this pin is its SHA-256. Re-vendor and update the pin
+          # together. Do not fetch the rolling bootstrapper at build time.
+          $GET_PIP_SHA256 = "fb24e693bab954209a063d90953621412ccad4a500905a726286e038f508ddf6"
 
           # 1. Create clean build_stage directories
           New-Item -ItemType Directory -Path "build_stage\python" -Force | Out-Null
@@ -73,18 +71,13 @@ jobs:
           $pthLines = @("python312.zip", ".", "Lib\site-packages", "..\app", "import site")
           Set-Content -Path $pthFile -Value $pthLines
 
-          # 4. Bootstrap pip into embedded python (hash-verified before use).
-          # NOTE: bootstrap.pypa.io/pip/<ver>/ only hosts up to Python 3.9;
-          # for 3.10+ the supported URL is the top-level get-pip.py.
-          Invoke-WebRequest -Uri "https://bootstrap.pypa.io/get-pip.py" -OutFile "get-pip.py"
+          # 4. Bootstrap pip from the vendored copy (hash-verified before use).
+          Copy-Item -Path "ci\get-pip.py" -Destination "get-pip.py"
           $actualPipHash = (Get-FileHash -Path "get-pip.py" -Algorithm SHA256).Hash.ToLower()
-          if ($GET_PIP_SHA256 -notmatch "^[0-9a-fA-F]{64}$") {
-            Write-Warning "GET_PIP_SHA256 is not pinned (spec item 22d INCOMPLETE): skipping get-pip.py hash verification."
-          } elseif ($actualPipHash -ne $GET_PIP_SHA256.ToLower()) {
+          if ($actualPipHash -ne $GET_PIP_SHA256.ToLower()) {
             throw "SHA-256 MISMATCH for get-pip.py: expected $($GET_PIP_SHA256), got $actualPipHash. Refusing to run an unverified bootstrapper."
-          } else {
-            Write-Host "get-pip.py SHA-256 verified."
           }
+          Write-Host "get-pip.py SHA-256 verified."
           & "build_stage\python\python.exe" get-pip.py --no-warn-script-location
           Remove-Item "get-pip.py"
 
