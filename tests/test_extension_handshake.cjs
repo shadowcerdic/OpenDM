@@ -162,7 +162,11 @@ async function check(name, fn) {
     if (iCancel === -1) throw new Error("cancel() never called after ACK");
     if (iFetchResolve === -1) throw new Error("fetch never resolved (stub issue)");
     if (iCancel < iFetchResolve) throw new Error(`cancel() at event ${iCancel} fired BEFORE ACK at event ${iFetchResolve} (order: ${w.types().join(",")})`);
-    if (iSuggest !== -1) throw new Error("suggest() should not be called on ACK path");
+    if (iSuggest === -1) throw new Error("suggest() must be called once on the ACK path (listener returned true)");
+    if (iSuggest < iFetchResolve) throw new Error(`suggest() at event ${iSuggest} fired BEFORE ACK at event ${iFetchResolve}`);
+    if (w.count("suggest") !== 1) throw new Error(`suggest() must be called exactly once, got ${w.count("suggest")}`);
+    const suggested = w.events.find(e => e.t === "suggest");
+    if (suggested.filename !== undefined) throw new Error("ACK path must suggest() with no filename change");
     if (w.indexOf("erase") === -1) throw new Error("erase() not called");
   });
 
@@ -189,7 +193,8 @@ async function check(name, fn) {
     const secondToken = w.events.find(e => e.t === "fetch-start" && e.call === 2).token;
     if (secondToken !== "tok-2") throw new Error(`retry did not use refetched token (got ${secondToken})`);
     if (w.indexOf("cancel") === -1) throw new Error("cancel() not called after retry ACK");
-    if (w.indexOf("suggest") !== -1) throw new Error("suggest() should not be called on retry ACK path");
+    if (w.indexOf("suggest") === -1) throw new Error("suggest() must be called once on the retry ACK path");
+    if (w.count("suggest") !== 1) throw new Error(`suggest() must be called exactly once, got ${w.count("suggest")}`);
   });
 
   await check("4. daemon non-ok (400) -> suggest, no cancel", async () => {

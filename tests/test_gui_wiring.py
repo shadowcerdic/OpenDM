@@ -30,10 +30,13 @@ def qapp():
 
 
 @pytest.fixture()
-def win(qapp, monkeypatch):
+def win(qapp, monkeypatch, tmp_path):
     """A MainWindow whose embedded daemon startup is stubbed out so tests
-    never bind a real port. The original is kept as
+    never bind a real port. Config dir is isolated so UI-pref tests cannot
+    touch the real daemon.json. The original is kept as
     win._real_start_embedded_daemon for the daemon-specific test."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("APPDATA", str(tmp_path))
     orig = gui.MainWindow._start_embedded_daemon
     monkeypatch.setattr(gui.MainWindow, "_start_embedded_daemon", lambda self: None)
     w = gui.MainWindow()
@@ -109,6 +112,46 @@ def test_speed_slider_zero_means_unlimited(win, fake_qm):
     win._on_speed_slider_changed(0)
     assert fake_qm.set_speed_limit_calls == [0]
     assert win.speed_slider_lbl.text() == "Unlimited"
+
+
+def test_startup_restores_saved_proxy_speed_and_autocheck(qapp, monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    from opendm import security
+    security.save_ui_settings(
+        proxy="http://127.0.0.1:8080",
+        auto_check_updates=False,
+        speed_limit_mb=4,
+    )
+    monkeypatch.setattr(gui.MainWindow, "_start_embedded_daemon", lambda self: None)
+    w = gui.MainWindow()
+    try:
+        assert w.qm.proxy == "http://127.0.0.1:8080"
+        assert w.auto_check_updates is False
+        assert w.speed_slider.value() == 4
+        assert w.speed_slider_lbl.text() == "4 MB/s"
+    finally:
+        w.close()
+
+
+def test_speed_slider_persists_mb_value(win, fake_qm):
+    from opendm import security
+    win.qm = fake_qm
+    win._on_speed_slider_changed(10)
+    assert security.load_ui_settings()["speed_limit_mb"] == 10
+
+
+def test_commit_network_settings_persists_without_dropping_speed(win, fake_qm):
+    from opendm import security
+    security.save_ui_settings(speed_limit_mb=7)
+    win.qm = fake_qm
+    win._commit_network_settings("socks5://127.0.0.1:1080", False)
+    prefs = security.load_ui_settings()
+    assert win.qm.proxy == "socks5://127.0.0.1:1080"
+    assert win.auto_check_updates is False
+    assert prefs["proxy"] == "socks5://127.0.0.1:1080"
+    assert prefs["auto_check_updates"] is False
+    assert prefs["speed_limit_mb"] == 7
 
 
 def test_no_dead_job_speed_limit_block():
@@ -241,6 +284,64 @@ def test_finish_verified_false_deletes_and_errors_no_launch(win, tmp_path, monke
     assert "NOT be launched" in critical[0][2]
     assert asked == []  # no install prompt
     assert launched == []  # installer NOT launched
+
+
+def test_finish_uses_reserved_job_dest_not_stale_target(win, tmp_path, monkeypatch):
+    """If the queue renamed the installer, verify and launch that file.
+
+    A leftover OpenDM-Setup-*.exe or .opendm.part makes QueueManager.add
+    reserve \"name (1).exe\". Checking the originally requested path would
+    either reject a good download or launch the stale file.
+    """
+    stale = tmp_path / "OpenDM-Setup-v9.9.9.exe"
+    stale.write_bytes(b"old-installer")
+    reserved = tmp_path / "OpenDM-Setup-v9.9.9 (1).exe"
+    reserved.write_bytes(b"new-installer")
+    seen = []
+
+    def fake_verify(path, expected):
+        seen.append((path, expected))
+        return path == str(reserved)
+
+    monkeypatch.setattr("opendm.updater.verify_installer", fake_verify)
+    asked = []
+    monkeypatch.setattr(
+        gui.QMessageBox, "question",
+        lambda *a, **k: (asked.append(a), gui.QMessageBox.Yes)[1],
+    )
+    monkeypatch.setattr(gui.QMessageBox, "critical", lambda *a, **k: None)
+    launched = []
+    monkeypatch.setattr(win, "_launch_installer_and_quit", lambda p: launched.append(p))
+
+    class _Job:
+        dest = str(reserved)
+
+    win._finish_update_download(_Job(), str(stale), "v9.9.9", "ab" * 32)
+
+    assert seen == [(str(reserved), "ab" * 32)]
+    assert launched == [str(reserved)]
+    assert stale.exists() and stale.read_bytes() == b"old-installer"
+    assert reserved.exists()
+
+
+def test_finish_mismatch_deletes_reserved_file_not_stale_target(win, tmp_path, monkeypatch):
+    stale = tmp_path / "OpenDM-Setup-v9.9.9.exe"
+    stale.write_bytes(b"old-installer")
+    reserved = tmp_path / "OpenDM-Setup-v9.9.9 (1).exe"
+    reserved.write_bytes(b"bad-installer")
+    monkeypatch.setattr("opendm.updater.verify_installer", lambda p, h: False)
+    monkeypatch.setattr(gui.QMessageBox, "critical", lambda *a, **k: None)
+    launched = []
+    monkeypatch.setattr(win, "_launch_installer_and_quit", lambda p: launched.append(p))
+
+    class _Job:
+        dest = str(reserved)
+
+    win._finish_update_download(_Job(), str(stale), "v9.9.9", "ab" * 32)
+
+    assert not reserved.exists()
+    assert stale.exists() and stale.read_bytes() == b"old-installer"
+    assert launched == []
 
 
 def test_finish_none_hash_deletes_and_errors(win, tmp_path, monkeypatch):

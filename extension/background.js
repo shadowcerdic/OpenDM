@@ -177,10 +177,14 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
     }
 
     if (accepted) {
-      // Daemon confirmed it took the job — now cancel the native download.
+      // Daemon confirmed it took the job — cancel the native download.
+      // suggest() is still required: the listener returned true, and Chrome
+      // blocks the download until suggest() is called exactly once. No
+      // filename override, so a late suggest cannot rename the item.
       chrome.downloads.cancel(item.id, () => {
         chrome.downloads.erase({ id: item.id });
       });
+      suggest();
       clearErrorBadge();
     } else {
       // Daemon did not take the job — let the browser download normally.

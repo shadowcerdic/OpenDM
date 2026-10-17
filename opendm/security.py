@@ -60,9 +60,16 @@ def load_or_create_config() -> dict:
             "chrome-extension://hnhmponoadleelhnecpijhnlpefkjflc",
         ],
     }
+    _write_config(data)
+    return data
+
+
+def _write_config(data: dict) -> None:
+    """Atomically replace daemon.json, mode 0600. Preserves every key in data."""
+    cp = config_path()
+    cp.parent.mkdir(parents=True, exist_ok=True)
     tmp = cp.with_suffix(".tmp")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    fd = os.open(tmp, flags, 0o600)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp, cp)
@@ -70,7 +77,55 @@ def load_or_create_config() -> dict:
         os.chmod(cp, 0o600)
     except Exception:
         pass
-    return data
+
+
+_SPEED_LIMIT_MB_MAX = 100
+
+
+def load_ui_settings() -> dict:
+    """Persisted GUI prefs. Missing keys use the same defaults as a fresh install."""
+    cfg = load_or_create_config()
+    proxy = cfg.get("proxy") or ""
+    if not isinstance(proxy, str):
+        proxy = ""
+    auto = cfg.get("auto_check_updates", True)
+    if not isinstance(auto, bool):
+        auto = True
+    try:
+        speed = int(cfg.get("speed_limit_mb") or 0)
+    except (TypeError, ValueError):
+        speed = 0
+    return {
+        "proxy": proxy,
+        "auto_check_updates": auto,
+        "speed_limit_mb": max(0, min(_SPEED_LIMIT_MB_MAX, speed)),
+    }
+
+
+def save_ui_settings(
+    *,
+    proxy: str | None = None,
+    auto_check_updates: bool | None = None,
+    speed_limit_mb: int | None = None,
+) -> dict:
+    """Merge UI prefs into daemon.json. Does not rotate the session token.
+
+    None leaves that key unchanged. speed_limit_mb is clamped to 0..100
+    (the slider range; 0 = unlimited).
+    """
+    cfg = load_or_create_config()
+    if proxy is not None:
+        cfg["proxy"] = proxy if isinstance(proxy, str) else ""
+    if auto_check_updates is not None:
+        cfg["auto_check_updates"] = bool(auto_check_updates)
+    if speed_limit_mb is not None:
+        try:
+            speed = int(speed_limit_mb)
+        except (TypeError, ValueError):
+            speed = 0
+        cfg["speed_limit_mb"] = max(0, min(_SPEED_LIMIT_MB_MAX, speed))
+    _write_config(cfg)
+    return cfg
 
 
 def origin_allowed(origin: str | None, patterns: list[str]) -> bool:

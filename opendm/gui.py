@@ -417,6 +417,21 @@ def update_sha_offer_line(expected_sha256: str | None) -> str:
     return "No SHA-256 checksum published for this release — automatic install is unavailable."
 
 
+def update_artifact_path(job, target_path: str) -> str:
+    """Path the engine actually wrote, not the name requested before reservation.
+
+    QueueManager.add may rename the file (``name (1).exe``) when the requested
+    path or its ``.opendm.part`` already exists. Verify, launch, and delete
+    that path. A missing or empty ``job.dest`` falls back to ``target_path``
+    so callers that have not reserved a destination still work.
+    """
+    dest = getattr(job, "dest", None)
+    if isinstance(dest, str) and dest:
+        return dest
+    return target_path
+
+
+
 def update_no_hash_notice_line(html_url: str | None) -> str:
     """Notice shown instead of the auto-install button when the release
     publishes no SHA-256 checksum. Points the user at the release page
@@ -455,6 +470,7 @@ class MainWindow(QMainWindow):
         self._items_by_id = {}
 
         self._build_ui()
+        self._apply_saved_ui_settings()
         self._setup_system_tray()
 
         # Update timer
@@ -791,6 +807,25 @@ class MainWindow(QMainWindow):
                     "Download URL has been refreshed successfully.\nYou can now Resume the download."
                 )
 
+    def _apply_saved_ui_settings(self):
+        """Restore proxy, auto-update, and speed slider from daemon.json."""
+        from .security import load_ui_settings
+        prefs = load_ui_settings()
+        self.qm.proxy = prefs["proxy"] or None
+        self.auto_check_updates = bool(prefs["auto_check_updates"])
+        mb = int(prefs["speed_limit_mb"])
+        self.speed_slider.setValue(mb)
+        # setValue does not emit when the value is unchanged (startup is 0).
+        self._on_speed_slider_changed(mb)
+
+    def _commit_network_settings(self, proxy_text: str, auto_check: bool):
+        """Apply and persist proxy + startup update check. Does not touch speed."""
+        from .security import save_ui_settings
+        p_val = (proxy_text or "").strip()
+        self.qm.proxy = p_val or None
+        self.auto_check_updates = bool(auto_check)
+        save_ui_settings(proxy=p_val, auto_check_updates=self.auto_check_updates)
+
     def _on_speed_slider_changed(self, val: int):
         if val == 0:
             self.speed_slider_lbl.setText("Unlimited")
@@ -801,6 +836,8 @@ class MainWindow(QMainWindow):
         # Wire straight into the QueueManager's shared token bucket so the
         # limit applies live to every job (0 = unlimited).
         self.qm.set_speed_limit(limit_bytes)
+        from .security import save_ui_settings
+        save_ui_settings(speed_limit_mb=int(val))
 
     def open_settings(self):
         """Proxy configuration dialog (HTTP / SOCKS5)."""
@@ -832,10 +869,9 @@ class MainWindow(QMainWindow):
         lay.addWidget(bb)
 
         if dlg.exec():
-            p_val = proxy_in.text().strip()
-            self.qm.proxy = p_val if p_val else None
-            self.auto_check_updates = auto_update_cb.isChecked()
-            QMessageBox.information(self, "Settings Saved", f"Proxy set to: {p_val or 'None (Direct connection)'}")
+            self._commit_network_settings(proxy_in.text(), auto_update_cb.isChecked())
+            shown = (proxy_in.text() or "").strip()
+            QMessageBox.information(self, "Settings Saved", f"Proxy set to: {shown or 'None (Direct connection)'}")
 
     def check_updates_gui(self, manual: bool = True):
         """Asynchronously query GitHub Releases API and display update dialog."""
@@ -980,21 +1016,24 @@ class MainWindow(QMainWindow):
         """GUI-thread handler for a finished update download.
 
         Verifies the installer SHA-256 before offering to install it.
+        Uses the reserved destination (``job.dest``) when the queue renamed
+        the file away from the originally requested path.
         Must only ever run on the Qt GUI thread (it is marshaled there by
         _start_update_download via QTimer.singleShot).
         """
         from . import updater
-        if updater.verify_installer(target_path, expected_sha):
+        artifact = update_artifact_path(job, target_path)
+        if updater.verify_installer(artifact, expected_sha):
             ret = QMessageBox.question(
                 self, "Update Downloaded",
                 f"OpenDM {tag} has been downloaded and verified successfully.\n\nInstall update now?",
                 QMessageBox.Yes | QMessageBox.No
             )
             if ret == QMessageBox.Yes:
-                self._launch_installer_and_quit(target_path)
+                self._launch_installer_and_quit(artifact)
         else:
             try:
-                os.remove(target_path)
+                os.remove(artifact)
             except OSError:
                 pass
             QMessageBox.critical(

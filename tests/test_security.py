@@ -53,3 +53,40 @@ def test_token_file_permissions(tmp_path, monkeypatch):
     assert len(cfg["token"]) == 64
     mode = oct(p.stat().st_mode & 0o777)
     assert mode == "0o600", f"expected 0600, got {mode}"
+
+
+def test_ui_settings_roundtrip_keeps_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("APPDATA", raising=False)
+    if sys.platform == "win32":
+        monkeypatch.setenv("APPDATA", str(tmp_path))
+    original = security.load_or_create_config()
+    token = original["token"]
+    security.save_ui_settings(
+        proxy="socks5://127.0.0.1:1080",
+        auto_check_updates=False,
+        speed_limit_mb=12,
+    )
+    again = security.load_or_create_config()
+    prefs = security.load_ui_settings()
+    assert again["token"] == token
+    assert again["allowed_origins"] == original["allowed_origins"]
+    assert prefs == {
+        "proxy": "socks5://127.0.0.1:1080",
+        "auto_check_updates": False,
+        "speed_limit_mb": 12,
+    }
+
+
+def test_ui_settings_defaults_and_clamp(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("APPDATA", raising=False)
+    if sys.platform == "win32":
+        monkeypatch.setenv("APPDATA", str(tmp_path))
+    prefs = security.load_ui_settings()
+    assert prefs["proxy"] == ""
+    assert prefs["auto_check_updates"] is True
+    assert prefs["speed_limit_mb"] == 0
+    security.save_ui_settings(speed_limit_mb=500, proxy="", auto_check_updates=True)
+    assert security.load_ui_settings()["speed_limit_mb"] == 100
+
